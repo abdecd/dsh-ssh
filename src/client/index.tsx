@@ -815,37 +815,77 @@ function initSidebarButton() {
     }
   }
 
-  if (!document.getElementById('dsh-ssh-styles')) {
-    const style = document.createElement('style')
+  let style = document.getElementById('dsh-ssh-styles') as HTMLStyleElement | null
+  if (!style) {
+    style = document.createElement('style')
     style.id = 'dsh-ssh-styles'
-    style.textContent = `
-      [class*="headerActions"] {
-        max-width: none !important;
-        overflow: visible !important;
-      }
-      .dsh-ssh-header-btn {
-        width: 28px;
-        height: 28px;
-        border-radius: 50%;
-        border: none;
-        background: transparent;
-        color: var(--dsw-alias-label-secondary);
-        cursor: pointer;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        padding: 0;
-        margin: 0;
-        transition: background-color 0.15s, color 0.15s;
-      }
-      .dsh-ssh-header-btn:hover {
-        background: var(--dsw-alias-interactive-bg-hover);
-        color: var(--dsw-alias-label-primary);
-      }
-      @keyframes dshSshFadeIn {
-        from { opacity: 0; transform: scale(0.98); }
-        to { opacity: 1; transform: scale(1); }
-      }
+    document.head.appendChild(style)
+  }
+  style.textContent = `
+    [class*="sectionHeader"] [class*="headerActions"] {
+      max-width: none;
+      overflow: visible;
+    }
+    #dsh-ssh-add-remote-btn {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      corner-shape: round;
+      border: none;
+      background: transparent;
+      color: var(--dsw-alias-label-secondary);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      margin: 0;
+      flex: none;
+      box-sizing: border-box;
+      transition: background-color 0.15s, color 0.15s;
+    }
+    #dsh-ssh-add-remote-btn:hover {
+      background: var(--dsw-alias-interactive-bg-hover);
+      color: var(--dsw-alias-label-primary);
+    }
+    #dsh-ssh-add-remote-btn svg {
+      width: 15px;
+      height: 15px;
+      display: block;
+      flex-shrink: 0;
+      transition: width 0.15s, height 0.15s;
+    }
+
+    /* Collapsed sidebar (rail mode) adaptive styles matching native 36px rail controls */
+    [class*="rail"] #dsh-ssh-add-remote-btn {
+      width: 36px;
+      height: 36px;
+      color: var(--dsw-alias-label-primary);
+    }
+    [class*="rail"] #dsh-ssh-add-remote-btn:hover {
+      background: var(--dsw-alias-interactive-bg-hover);
+      color: var(--dsw-alias-label-primary);
+    }
+    [class*="rail"] #dsh-ssh-add-remote-btn svg {
+      width: 18px;
+      height: 18px;
+    }
+    [class*="rail"] [class*="sectionHeader"] {
+      height: auto;
+      justify-content: center;
+      align-items: center;
+    }
+    [class*="rail"] [class*="headerActions"] {
+      width: 36px;
+      flex-direction: column;
+      gap: 12px;
+      align-items: center;
+      justify-content: center;
+    }
+    @keyframes dshSshFadeIn {
+      from { opacity: 0; transform: scale(0.98); }
+      to { opacity: 1; transform: scale(1); }
+    }
 
       /* 100% Theme-adaptive dialog styles using real DSH variables */
       .dsh-ssh-modal-overlay {
@@ -995,8 +1035,6 @@ function initSidebarButton() {
         background-color: var(--dsw-alias-interactive-bg-hover) !important;
       }
     `
-    document.head.appendChild(style)
-  }
 
   // Mount modal container in document.body
   let modalHost = document.getElementById('dsh-ssh-modal-host')
@@ -1011,7 +1049,9 @@ function initSidebarButton() {
   const tryInjectButton = () => {
     if (document.getElementById('dsh-ssh-add-remote-btn')) return
 
-    const headerActions = document.querySelector('[class*="headerActions"]')
+    const headerActions =
+      document.querySelector('[class*="sectionHeader"] [class*="headerActions"]') ||
+      document.querySelector('[class*="headerActions"]')
     if (!headerActions) return
 
     const nativeAddBtn =
