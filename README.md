@@ -24,28 +24,16 @@
 > 💡 **关于密码登录支持**：
 > 默认推荐配置公钥免密登录；若需使用账号密码登录（或主机配置了 `PasswordAuthentication yes`），本机需安装 `sshpass` 工具（如 Debian/Ubuntu 执行 `sudo apt install sshpass`，macOS 执行 `brew install hudochenkov/sshpass/sshpass`）。密码由浏览器原生密码管理器安全保存，插件后端仅在内存中暂存，绝不落盘。
 
-### 1. 链接插件到 DSH web profile
-编辑 `~/.dsh/profiles/web/package.json`：
-
-在 `dependencies` 中添加软链接：
-```json
-"dependencies": {
-  "dsh-ssh": "link:/run/media/user1/78E6859DE6855BEE/code/js/dsh-ssh"
-}
+```bash
+# 从 GitHub 仓库安装
+dsh plugin --profile web add github:abdecd/dsh-ssh
 ```
 
-在 `dsh.profile.bundles` 数组中添加 `"dsh-ssh"`（**注意：排在 `dsh-better-sidebar` 之后**）：
-```json
-"bundles": [
-  "@deepseek-ai/dsh-base",
-  "@deepseek-ai/dsh-web-app",
-  "dsh-better-sidebar",
-  "dsh-ssh"
-]
-```
+重启 DSH Web 即可生效：
 
-### 2. 重启 DSH
-重启 `dsh web` 即可生效。
+```bash
+dsh web
+```
 
 ---
 
