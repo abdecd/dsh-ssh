@@ -5,9 +5,10 @@ export interface SshHostEntry {
     port?: number;
     identityFile?: string;
     proxyJump?: string;
+    passwordAuthentication?: boolean;
 }
 /**
  * Parse ~/.ssh/config and extract valid Host entries.
  * Skips wildcard entries (*, ?).
  */
-export declare function parseSshConfig(): SshHostEntry[];
+export declare function parseSshConfig(customPath?: string): SshHostEntry[];

@@ -27,6 +27,10 @@ export interface FsReadResult {
     truncated?: boolean;
     error?: string;
 }
+export declare function setHostPassword(host: string, pass?: string): void;
+export declare function getHostPassword(host: string): string | undefined;
+export declare function hasHostPassword(host: string): boolean;
+export declare function removeHostPassword(host: string): void;
 export declare function shellQuote(p: string): string;
 /**
  * Execute a command on remote host via OpenSSH CLI with ControlMaster socket multiplexing.
@@ -67,7 +71,7 @@ export declare function remoteSearchFiles(host: string, remotePath: string, loca
 /**
  * Test SSH connection to host.
  */
-export declare function testSshConnection(host: string): Promise<{
+export declare function testSshConnection(host: string, password?: string): Promise<{
     ok: boolean;
     message: string;
 }>;

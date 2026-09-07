@@ -3,6 +3,7 @@ export interface RemoteWorkspaceMeta {
     remotePath: string;
     title?: string;
     createdAt: number;
+    authType?: 'key' | 'password';
 }
 export declare function getBaseDir(): string;
 export declare function getWorkspacesDir(): string;
@@ -20,7 +21,7 @@ export declare function localToRemotePath(localPath: string, anchorDir: string, 
 /**
  * Create a new remote workspace anchor and register it into DSH workspaceRegistry.
  */
-export declare function createRemoteWorkspace(workspaceRegistry: any, host: string, remotePath: string, customTitle?: string): Promise<{
+export declare function createRemoteWorkspace(workspaceRegistry: any, host: string, remotePath: string, customTitle?: string, authType?: 'key' | 'password', password?: string): Promise<{
     ok: boolean;
     workspaceId?: string;
     anchorDir?: string;

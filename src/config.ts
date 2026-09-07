@@ -9,14 +9,15 @@ export interface SshHostEntry {
   port?: number
   identityFile?: string
   proxyJump?: string
+  passwordAuthentication?: boolean
 }
 
 /**
  * Parse ~/.ssh/config and extract valid Host entries.
  * Skips wildcard entries (*, ?).
  */
-export function parseSshConfig(): SshHostEntry[] {
-  const configPath = join(homedir(), '.ssh', 'config')
+export function parseSshConfig(customPath?: string): SshHostEntry[] {
+  const configPath = customPath || join(homedir(), '.ssh', 'config')
   if (!existsSync(configPath)) {
     return []
   }
@@ -25,7 +26,7 @@ export function parseSshConfig(): SshHostEntry[] {
     const content = readFileSync(configPath, 'utf8')
     const lines = content.split(/\r?\n/)
     const hosts: SshHostEntry[] = []
-    let current: SshHostEntry | null = null
+    let currentEntries: SshHostEntry[] = []
 
     for (const rawLine of lines) {
       const hashIdx = rawLine.indexOf('#')
@@ -38,16 +39,23 @@ export function parseSshConfig(): SshHostEntry[] {
 
       if (key === 'host') {
         const aliases = parts.slice(1).filter((a) => a && !a.includes('*') && !a.includes('?'))
+        currentEntries = []
         for (const alias of aliases) {
-          current = { host: alias }
-          hosts.push(current)
+          const entry: SshHostEntry = { host: alias }
+          currentEntries.push(entry)
+          hosts.push(entry)
         }
-      } else if (current) {
-        if (key === 'hostname') current.hostName = value
-        else if (key === 'user') current.user = value
-        else if (key === 'port') current.port = parseInt(value, 10) || 22
-        else if (key === 'identityfile') current.identityFile = value.replace(/^~(?=$|\/|\\)/, homedir())
-        else if (key === 'proxyjump') current.proxyJump = value
+      } else if (currentEntries.length > 0) {
+        for (const current of currentEntries) {
+          if (key === 'hostname') current.hostName = value
+          else if (key === 'user') current.user = value
+          else if (key === 'port') current.port = parseInt(value, 10) || 22
+          else if (key === 'identityfile') current.identityFile = value.replace(/^~(?=$|\/|\\)/, homedir())
+          else if (key === 'proxyjump') current.proxyJump = value
+          else if (key === 'passwordauthentication') {
+            current.passwordAuthentication = value.toLowerCase() === 'yes'
+          }
+        }
       }
     }
 

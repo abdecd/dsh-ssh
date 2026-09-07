@@ -2,7 +2,14 @@ import { opendir, stat, readFile, writeFile, rename, mkdir, rm, readdir } from '
 import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { findRemoteWorkspaceMeta, localToRemotePath } from './workspace'
-import { remoteListDir, remoteReadFile, remoteWriteFile, remoteSearchFiles } from './connection'
+import {
+  remoteListDir,
+  remoteReadFile,
+  remoteWriteFile,
+  remoteSearchFiles,
+  hasHostPassword,
+  removeHostPassword
+} from './connection'
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024 // 10MB
 
@@ -169,10 +176,35 @@ export function registerFsInterceptors(ctx: any) {
               // ==========================================
               const { meta, anchorDir } = remoteInfo
 
+              if (meta.authType === 'password' && !hasHostPassword(meta.host)) {
+                writeJson(res, 401, {
+                  ok: false,
+                  needAuth: true,
+                  host: meta.host,
+                  error: { code: 'need-auth', message: `远程主机 ${meta.host} 需密码认证（内存密码已失效）` }
+                })
+                return
+              }
+
+              const handleAuthError = (result: any) => {
+                if (meta.authType === 'password' && result.error && /认证失败|permission denied/i.test(result.error)) {
+                  removeHostPassword(meta.host)
+                  writeJson(res, 401, {
+                    ok: false,
+                    needAuth: true,
+                    host: meta.host,
+                    error: { code: 'need-auth', message: `远程主机 ${meta.host} 认证失败，请重新输入密码` }
+                  })
+                  return true
+                }
+                return false
+              }
+
               if (method === 'fs.tree') {
                 const targetLocal = payload.path || activeCwd || anchorDir
                 const remoteTarget = localToRemotePath(targetLocal, anchorDir, meta.remotePath)
                 const result = await remoteListDir(meta.host, remoteTarget, targetLocal)
+                if (handleAuthError(result)) return
                 if (result.ok && result.data) {
                   writeOk(res, result.data)
                 } else {
@@ -182,6 +214,7 @@ export function registerFsInterceptors(ctx: any) {
                 const targetLocal = payload.path
                 const remoteTarget = localToRemotePath(targetLocal, anchorDir, meta.remotePath)
                 const result = await remoteReadFile(meta.host, remoteTarget)
+                if (handleAuthError(result)) return
                 if (result.ok) {
                   writeOk(res, result)
                 } else {
@@ -191,6 +224,7 @@ export function registerFsInterceptors(ctx: any) {
                 const targetLocal = payload.path
                 const remoteTarget = localToRemotePath(targetLocal, anchorDir, meta.remotePath)
                 const result = await remoteWriteFile(meta.host, remoteTarget, payload.content || '')
+                if (handleAuthError(result)) return
                 if (result.ok) {
                   writeOk(res, { ok: true })
                 } else {
@@ -199,6 +233,7 @@ export function registerFsInterceptors(ctx: any) {
               } else if (method === 'fs.search') {
                 const targetLocal = activeCwd || anchorDir
                 const result = await remoteSearchFiles(meta.host, meta.remotePath, targetLocal, payload.query || '')
+                if (handleAuthError(result)) return
                 if (result.ok) {
                   writeOk(res, { entries: result.entries, truncated: result.truncated })
                 } else {

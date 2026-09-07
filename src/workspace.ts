@@ -1,12 +1,14 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, chmodSync, realpathSync } from 'node:fs'
 import { join, dirname, basename } from 'node:path'
 import { homedir } from 'node:os'
+import { setHostPassword } from './connection'
 
 export interface RemoteWorkspaceMeta {
   host: string
   remotePath: string
   title?: string
   createdAt: number
+  authType?: 'key' | 'password'
 }
 
 export function getBaseDir(): string {
@@ -80,7 +82,9 @@ export async function createRemoteWorkspace(
   workspaceRegistry: any,
   host: string,
   remotePath: string,
-  customTitle?: string
+  customTitle?: string,
+  authType?: 'key' | 'password',
+  password?: string
 ): Promise<{ ok: boolean; workspaceId?: string; anchorDir?: string; title?: string; error?: string }> {
   try {
     const id = 'ws-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6)
@@ -91,11 +95,17 @@ export async function createRemoteWorkspace(
     const folderName = basename(cleanRemote) || cleanRemote
     const title = customTitle || `${folderName} (${host})`
 
+    const isPassword = authType === 'password'
+    if (isPassword && password) {
+      setHostPassword(host, password)
+    }
+
     const meta: RemoteWorkspaceMeta = {
       host,
       remotePath: cleanRemote,
       title,
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      authType: isPassword ? 'password' : 'key'
     }
 
     writeFileSync(join(anchorDir, '.remote-ssh.json'), JSON.stringify(meta, null, 2), 'utf8')
@@ -228,7 +238,8 @@ if (meta && meta.host) {
   if (remotePath) {
     remoteCmd = 'cd ' + JSON.stringify(remotePath) + ' 2>/dev/null; exec \${SHELL:-/bin/bash} -l';
   }
-  const args = ['-tt', host];
+  const socketPath = path.join(require('os').homedir(), '.dsh', 'dsh-ssh', 'sockets', '%r@%h:%p');
+  const args = ['-o', 'ControlMaster=auto', '-o', 'ControlPath=' + socketPath, '-tt', host];
   if (remoteCmd) args.push(remoteCmd);
 
   const child = spawn('ssh', args, { stdio: 'inherit' });

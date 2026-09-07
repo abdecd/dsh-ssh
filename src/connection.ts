@@ -39,6 +39,31 @@ export interface FsReadResult {
   error?: string
 }
 
+// ---------------------------------------------------------------------------
+// In-Memory Password Store (Zero-Disk Security)
+// ---------------------------------------------------------------------------
+const memoryPasswords = new Map<string, string>()
+
+export function setHostPassword(host: string, pass?: string): void {
+  if (!pass) {
+    memoryPasswords.delete(host)
+  } else {
+    memoryPasswords.set(host, pass)
+  }
+}
+
+export function getHostPassword(host: string): string | undefined {
+  return memoryPasswords.get(host)
+}
+
+export function hasHostPassword(host: string): boolean {
+  return memoryPasswords.has(host)
+}
+
+export function removeHostPassword(host: string): void {
+  memoryPasswords.delete(host)
+}
+
 function getSocketDir(): string {
   const dir = join(homedir(), '.dsh', 'dsh-ssh', 'sockets')
   if (!existsSync(dir)) {
@@ -54,8 +79,14 @@ export function shellQuote(p: string): string {
 
 function translateSshError(text: string): string {
   const t = String(text || '')
+  if (/permission denied \(publickey,password/i.test(t)) {
+    return 'SSH 认证失败：密码错误或公钥未配置。'
+  }
   if (/permission denied \(publickey/i.test(t)) {
     return 'SSH 公钥认证失败：请确认私钥配置或目标主机的 ~/.ssh/authorized_keys 中已添加对应公钥。'
+  }
+  if (/permission denied/i.test(t)) {
+    return 'SSH 认证失败：密码错误或无访问权限。'
   }
   if (/connection refused/i.test(t)) {
     return 'SSH 连接被拒绝：请确认目标主机已开机、sshd 服务已启动且端口开放。'
@@ -81,27 +112,42 @@ export async function runSsh(
   const socketDir = getSocketDir()
   const socketPath = join(socketDir, '%r@%h:%p')
 
-  const args = [
-    '-o', 'BatchMode=yes',
+  const password = getHostPassword(host)
+
+  const baseArgs = [
     '-o', 'StrictHostKeyChecking=accept-new',
     '-o', 'ConnectTimeout=10',
     '-o', 'ServerAliveInterval=15',
     '-o', 'ClearAllForwardings=yes',
     '-o', 'ControlMaster=auto',
     '-o', `ControlPath=${socketPath}`,
-    '-o', 'ControlPersist=10m',
-    host,
-    command
+    '-o', 'ControlPersist=10m'
   ]
+
+  if (!password) {
+    baseArgs.push('-o', 'BatchMode=yes')
+  }
+
+  baseArgs.push(host, command)
+
+  let bin = 'ssh'
+  let finalArgs = baseArgs
+  let env = process.env
+
+  if (password) {
+    bin = 'sshpass'
+    finalArgs = ['-e', 'ssh', ...baseArgs]
+    env = { ...process.env, SSHPASS: password }
+  }
 
   return new Promise((resolve) => {
     let stdoutText = ''
     let stderrText = ''
     let resolved = false
 
-    const child = spawn('ssh', args, {
+    const child = spawn(bin, finalArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: process.env
+      env
     })
 
     const timer = setTimeout(() => {
@@ -417,10 +463,16 @@ export async function remoteSearchFiles(
 /**
  * Test SSH connection to host.
  */
-export async function testSshConnection(host: string): Promise<{ ok: boolean; message: string }> {
+export async function testSshConnection(host: string, password?: string): Promise<{ ok: boolean; message: string }> {
+  if (password) {
+    setHostPassword(host, password)
+  }
   const r = await runSsh(host, 'echo "OK"', undefined, 8000)
   if (r.ok && r.stdout.includes('OK')) {
     return { ok: true, message: '连接成功！' }
+  }
+  if (password && !r.ok) {
+    removeHostPassword(host)
   }
   return { ok: false, message: r.error || r.stderr || '连接失败' }
 }

@@ -21,6 +21,9 @@
 
 ## 安装与启用
 
+> 💡 **关于密码登录支持**：
+> 默认推荐配置公钥免密登录；若需使用账号密码登录（或主机配置了 `PasswordAuthentication yes`），本机需安装 `sshpass` 工具（如 Debian/Ubuntu 执行 `sudo apt install sshpass`，macOS 执行 `brew install hudochenkov/sshpass/sshpass`）。密码由浏览器原生密码管理器安全保存，插件后端仅在内存中暂存，绝不落盘。
+
 ### 1. 链接插件到 DSH web profile
 编辑 `~/.dsh/profiles/web/package.json`：
 

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseSshConfig, localToRemotePath } from '../lib/index.js'
+import { parseSshConfig, localToRemotePath, setHostPassword, getHostPassword, hasHostPassword, removeHostPassword } from '../lib/index.js'
 
 test('parseSshConfig correctly parses ~/.ssh/config', () => {
   const hosts = parseSshConfig()
@@ -88,4 +88,56 @@ test('hookWorkspaceRegistryDeletion removes anchor directory upon deletion', asy
     process.env.HOME = oldHome
     fs.rmSync(fakeHome, { recursive: true, force: true })
   }
+})
+
+test('parseSshConfig parses PasswordAuthentication correctly', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+  const tempConfig = path.join(os.tmpdir(), `ssh-config-test-${Date.now()}`)
+
+  const sampleConfig = `
+Host pass-host
+  HostName 192.168.1.50
+  User root
+  PasswordAuthentication yes
+
+Host key-host
+  HostName 192.168.1.51
+  User ubuntu
+  PasswordAuthentication no
+
+Host default-host
+  HostName 192.168.1.52
+`
+  fs.writeFileSync(tempConfig, sampleConfig, 'utf8')
+  try {
+    const entries = parseSshConfig(tempConfig)
+    assert.equal(entries.length, 3)
+
+    const pass = entries.find((e) => e.host === 'pass-host')
+    assert(pass, 'pass-host should exist')
+    assert.equal(pass.passwordAuthentication, true)
+
+    const key = entries.find((e) => e.host === 'key-host')
+    assert(key, 'key-host should exist')
+    assert.equal(key.passwordAuthentication, false)
+
+    const def = entries.find((e) => e.host === 'default-host')
+    assert(def, 'default-host should exist')
+    assert.equal(def.passwordAuthentication, undefined)
+  } finally {
+    fs.rmSync(tempConfig, { force: true })
+  }
+})
+
+test('in-memory password store operations', () => {
+  assert.equal(hasHostPassword('test-host-xyz'), false)
+  setHostPassword('test-host-xyz', 'mySecret123')
+  assert.equal(hasHostPassword('test-host-xyz'), true)
+  assert.equal(getHostPassword('test-host-xyz'), 'mySecret123')
+
+  removeHostPassword('test-host-xyz')
+  assert.equal(hasHostPassword('test-host-xyz'), false)
+  assert.equal(getHostPassword('test-host-xyz'), undefined)
 })

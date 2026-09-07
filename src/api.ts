@@ -1,7 +1,7 @@
 import { readdirSync, existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { parseSshConfig } from './config'
-import { testSshConnection, remoteListDir } from './connection'
+import { testSshConnection, remoteListDir, hasHostPassword, setHostPassword } from './connection'
 import { createRemoteWorkspace, deleteRemoteWorkspace, getWorkspacesDir, RemoteWorkspaceMeta } from './workspace'
 
 const MAX_BODY_BYTES = 1024 * 1024 // 1MB
@@ -41,9 +41,15 @@ export function registerApiRoutes(ctx: any) {
             return
           }
 
+          if (method === 'auth-status') {
+            const host = url.searchParams.get('host') || ''
+            sendJson(res, 200, { ok: true, host, hasPassword: hasHostPassword(host) })
+            return
+          }
+
           if (method === 'workspaces') {
             const wsDir = getWorkspacesDir()
-            const list: Array<{ anchorDir: string; meta: RemoteWorkspaceMeta }> = []
+            const list: Array<{ anchorDir: string; meta: RemoteWorkspaceMeta; hasPassword?: boolean }> = []
             if (existsSync(wsDir)) {
               for (const name of readdirSync(wsDir)) {
                 const sub = join(wsDir, name)
@@ -51,7 +57,11 @@ export function registerApiRoutes(ctx: any) {
                 if (existsSync(jsonPath)) {
                   try {
                     const meta = JSON.parse(readFileSync(jsonPath, 'utf8'))
-                    list.push({ anchorDir: sub, meta })
+                    list.push({
+                      anchorDir: sub,
+                      meta,
+                      hasPassword: meta.authType === 'password' ? hasHostPassword(meta.host) : true
+                    })
                   } catch {}
                 }
               }
@@ -67,12 +77,27 @@ export function registerApiRoutes(ctx: any) {
 
           const body = await readJson(req)
 
+          if (method === 'auth-submit') {
+            if (!body.host || !body.password) {
+              sendJson(res, 400, { ok: false, error: 'host and password are required' })
+              return
+            }
+            const r = await testSshConnection(body.host, body.password)
+            if (r.ok) {
+              setHostPassword(body.host, body.password)
+              sendJson(res, 200, { ok: true, message: '认证成功' })
+            } else {
+              sendJson(res, 400, { ok: false, error: r.message || '密码验证失败' })
+            }
+            return
+          }
+
           if (method === 'test') {
             if (!body.host) {
               sendJson(res, 400, { ok: false, error: 'host is required' })
               return
             }
-            const r = await testSshConnection(body.host)
+            const r = await testSshConnection(body.host, body.password)
             sendJson(res, 200, r)
             return
           }
@@ -103,7 +128,9 @@ export function registerApiRoutes(ctx: any) {
               ctx.workspaceRegistry,
               body.host,
               body.remotePath,
-              body.title
+              body.title,
+              body.authType,
+              body.password
             )
             sendJson(res, r.ok ? 200 : 400, r)
             return

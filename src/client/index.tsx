@@ -8,6 +8,7 @@ interface SshHost {
   port?: number
   identityFile?: string
   proxyJump?: string
+  passwordAuthentication?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -19,6 +20,8 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
   const [selectedHost, setSelectedHost] = useState('')
   const [remotePath, setRemotePath] = useState('')
   const [title, setTitle] = useState('')
+  const [usePassword, setUsePassword] = useState(false)
+  const [password, setPassword] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null)
@@ -28,12 +31,17 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
     if (isOpen) {
       setErrorMsg(null)
       setTestResult(null)
+      setPassword('')
       fetch('/dsh-ssh/api/hosts')
         .then((r) => r.json())
         .then((res) => {
           if (res.ok && res.hosts?.length > 0) {
             setHosts(res.hosts)
-            setSelectedHost(res.hosts[0].host)
+            const first = res.hosts[0]
+            setSelectedHost(first.host)
+            if (first.passwordAuthentication) {
+              setUsePassword(true)
+            }
           }
         })
         .catch(() => {})
@@ -41,6 +49,15 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
   }, [isOpen])
 
   if (!isOpen) return null
+
+  const handleHostChange = (newHost: string) => {
+    setSelectedHost(newHost)
+    setTestResult(null)
+    const match = hosts.find((h) => h.host === newHost)
+    if (match?.passwordAuthentication) {
+      setUsePassword(true)
+    }
+  }
 
   const handleTest = async () => {
     if (!selectedHost) return
@@ -50,7 +67,10 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
       const res = await fetch('/dsh-ssh/api/test', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ host: selectedHost })
+        body: JSON.stringify({
+          host: selectedHost,
+          password: usePassword ? password : undefined
+        })
       }).then((r) => r.json())
       setTestResult({ ok: res.ok, msg: res.message || (res.ok ? '连接成功' : '连接失败') })
     } catch (e: any) {
@@ -66,6 +86,10 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
       setErrorMsg('请选择主机并填写远程项目绝对路径')
       return
     }
+    if (usePassword && !password) {
+      setErrorMsg('已勾选密码登录，请输入密码')
+      return
+    }
 
     setSubmitting(true)
     setErrorMsg(null)
@@ -76,7 +100,9 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
         body: JSON.stringify({
           host: selectedHost,
           remotePath: remotePath.trim(),
-          title: title.trim() || undefined
+          title: title.trim() || undefined,
+          authType: usePassword ? 'password' : 'key',
+          password: usePassword ? password : undefined
         })
       }).then((r) => r.json())
 
@@ -134,6 +160,17 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
 
         {/* Form Body */}
         <form onSubmit={handleSubmit} style={{ padding: '20px 22px' }}>
+          {/* Hidden username input to enable browser credential management */}
+          <input
+            type="text"
+            name="username"
+            value={selectedHost}
+            readOnly
+            tabIndex={-1}
+            autoComplete="username"
+            style={{ position: 'absolute', opacity: 0, pointerEvents: 'none', height: 0, width: 0 }}
+          />
+
           {errorMsg && (
             <div
               style={{
@@ -157,13 +194,14 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
             <div style={{ display: 'flex', gap: '8px' }}>
               <select
                 value={selectedHost}
-                onChange={(e) => setSelectedHost(e.target.value)}
+                onChange={(e) => handleHostChange(e.target.value)}
                 className="dsh-ssh-select"
                 style={{ flex: 1 }}
               >
                 {hosts.map((h) => (
                   <option key={h.host} value={h.host}>
                     {h.host} {h.hostName ? `(${h.user || 'user'}@${h.hostName})` : ''}
+                    {h.passwordAuthentication ? ' [密码登录]' : ''}
                   </option>
                 ))}
               </select>
@@ -176,11 +214,52 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
                 {testing ? '测试中...' : '测试连接'}
               </button>
             </div>
+
+            <label
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+                fontSize: '12px',
+                cursor: 'pointer',
+                marginTop: '8px',
+                color: 'var(--dsw-alias-label-secondary)'
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={usePassword}
+                onChange={(e) => setUsePassword(e.target.checked)}
+              />
+              <span>使用密码登录 (Password Authentication)</span>
+            </label>
+
+            {usePassword && (
+              <div style={{ marginTop: '10px' }}>
+                <label className="dsh-ssh-label">
+                  SSH 登录密码 <span style={{ color: 'var(--dsw-alias-state-error-primary, #cf222e)' }}>*</span>
+                  <span style={{ fontWeight: 'normal', color: 'var(--dsw-alias-label-tertiary)', marginLeft: 6 }}>
+                    (由浏览器保管，后端仅存内存不落盘)
+                  </span>
+                </label>
+                <input
+                  type="password"
+                  name="password"
+                  autoComplete="current-password"
+                  required
+                  className="dsh-ssh-input"
+                  placeholder="输入 SSH 登录密码（可被浏览器保存）"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                />
+              </div>
+            )}
+
             {testResult && (
               <div
                 style={{
                   fontSize: '12px',
-                  marginTop: '6px',
+                  marginTop: '8px',
                   fontWeight: 500,
                   color: testResult.ok
                     ? 'var(--dsw-alias-state-success-primary, #1a7f37)'
@@ -231,10 +310,157 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
             </button>
             <button
               type="submit"
-              disabled={submitting || !remotePath.trim()}
+              disabled={submitting || !remotePath.trim() || (usePassword && !password)}
               className="dsh-ssh-btn-primary"
             >
               {submitting ? '创建中...' : '创建工作区'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>,
+    document.body
+  )
+}
+
+// ---------------------------------------------------------------------------
+// ReAuth Modal Dialog (Automatic Reconnection via Browser Password Autofill)
+// ---------------------------------------------------------------------------
+
+export function ReAuthModal({
+  host,
+  isOpen,
+  onClose,
+  onSuccess
+}: {
+  host: string
+  isOpen: boolean
+  onClose: () => void
+  onSuccess?: () => void
+}) {
+  const [rePassword, setRePassword] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [errorMsg, setErrorMsg] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (isOpen) {
+      setErrorMsg(null)
+      setRePassword('')
+    }
+  }, [isOpen])
+
+  if (!isOpen || !host) return null
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!rePassword) return
+
+    setSubmitting(true)
+    setErrorMsg(null)
+    try {
+      const res = await fetch('/dsh-ssh/api/auth-submit', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ host, password: rePassword })
+      }).then((r) => r.json())
+
+      if (res.ok) {
+        onSuccess?.()
+        onClose()
+      } else {
+        setErrorMsg(res.error || '认证失败，请检查密码')
+      }
+    } catch (err: any) {
+      setErrorMsg(err?.message || '网络请求错误')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return ReactDOM.createPortal(
+    <div
+      className="dsh-ssh-modal-overlay"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose()
+      }}
+    >
+      <div className="dsh-ssh-modal-card" style={{ width: 440 }}>
+        <div className="dsh-ssh-modal-header">
+          <div className="dsh-ssh-modal-title">
+            <span>🔐 重新输入远程密码</span>
+          </div>
+          <button type="button" className="dsh-ssh-modal-close" onClick={onClose} title="关闭">
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        </div>
+
+        <form onSubmit={handleSubmit} style={{ padding: '20px 22px' }}>
+          <input
+            type="text"
+            name="username"
+            value={host}
+            readOnly
+            tabIndex={-1}
+            autoComplete="username"
+            style={{ position: 'absolute', opacity: 0, pointerEvents: 'none', height: 0, width: 0 }}
+          />
+
+          <div style={{ marginBottom: '14px', fontSize: '13px', lineHeight: '20px', color: 'var(--dsw-alias-label-secondary)' }}>
+            主机 <strong style={{ color: 'var(--dsw-alias-label-primary)' }}>{host}</strong> 的连接需密码验证（或此前内存中的密码已过期）。
+            若浏览器已保存密码已为你自动填充，确认即可恢复连接。
+          </div>
+
+          {errorMsg && (
+            <div
+              style={{
+                padding: '10px 14px',
+                borderRadius: '8px',
+                marginBottom: '16px',
+                fontSize: '13px',
+                backgroundColor: 'rgba(248, 81, 73, 0.1)',
+                border: '1px solid rgba(248, 81, 73, 0.25)',
+                color: 'var(--dsw-alias-state-error-primary, #cf222e)'
+              }}
+            >
+              {errorMsg}
+            </div>
+          )}
+
+          <div style={{ marginBottom: '20px' }}>
+            <label className="dsh-ssh-label">
+              SSH 登录密码 <span style={{ color: 'var(--dsw-alias-state-error-primary, #cf222e)' }}>*</span>
+            </label>
+            <input
+              type="password"
+              name="password"
+              autoComplete="current-password"
+              autoFocus
+              required
+              className="dsh-ssh-input"
+              placeholder="输入或确认密码"
+              value={rePassword}
+              onChange={(e) => setRePassword(e.target.value)}
+            />
+          </div>
+
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
+            <button type="button" onClick={onClose} className="dsh-ssh-btn-secondary">
+              取消
+            </button>
+            <button type="submit" disabled={submitting || !rePassword} className="dsh-ssh-btn-primary">
+              {submitting ? '验证中...' : '确认并连接'}
             </button>
           </div>
         </form>
@@ -249,16 +475,56 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
 // ---------------------------------------------------------------------------
 
 let openModalGlobal: () => void = () => {}
+let openReAuthGlobal: (host: string) => void = () => {}
 
 function GlobalModalHost() {
   const [isOpen, setIsOpen] = useState(false)
+  const [reAuthHost, setReAuthHost] = useState<string | null>(null)
+
   useEffect(() => {
     openModalGlobal = () => setIsOpen(true)
+    openReAuthGlobal = (h: string) => setReAuthHost(h)
   }, [])
-  return <AddRemoteModal isOpen={isOpen} onClose={() => setIsOpen(false)} />
+
+  return (
+    <>
+      <AddRemoteModal isOpen={isOpen} onClose={() => setIsOpen(false)} />
+      <ReAuthModal
+        host={reAuthHost || ''}
+        isOpen={Boolean(reAuthHost)}
+        onClose={() => setReAuthHost(null)}
+        onSuccess={() => {
+          setReAuthHost(null)
+          window.dispatchEvent(new CustomEvent('dsh-ssh-reauth-success', { detail: { host: reAuthHost } }))
+        }}
+      />
+    </>
+  )
 }
 
 function initSidebarButton() {
+  // Hook window.fetch once to catch 401 needAuth requests from better-sidebar or tools
+  if (typeof window !== 'undefined' && !(window as any).__dsh_ssh_fetch_hooked__) {
+    ;(window as any).__dsh_ssh_fetch_hooked__ = true
+    const origFetch = window.fetch
+    window.fetch = async function (input: RequestInfo | URL, init?: RequestInit) {
+      const res = await origFetch.call(this, input, init)
+      const url = typeof input === 'string' ? input : (input && typeof input === 'object' && 'url' in input ? (input as Request).url : String(input || ''))
+      if (url.includes('/sidebar/api/fs') || url.includes('/dsh-ssh/api/')) {
+        if (res.status === 401) {
+          try {
+            const clone = res.clone()
+            const data = await clone.json()
+            if (data && data.needAuth && data.host) {
+              openReAuthGlobal(data.host)
+            }
+          } catch {}
+        }
+      }
+      return res
+    }
+  }
+
   if (!document.getElementById('dsh-ssh-styles')) {
     const style = document.createElement('style')
     style.id = 'dsh-ssh-styles'
@@ -307,45 +573,40 @@ function initSidebarButton() {
         width: 480px;
         max-width: min(520px, 92vw);
         background: var(--dsw-alias-bg-base) !important;
-        color: var(--dsw-alias-label-primary) !important;
+        border: 1px solid var(--dsw-alias-border-l1) !important;
         border-radius: 12px;
-        border: .5px solid var(--dsw-alias-border-l3) !important;
-        box-shadow: var(--dsw-elevation-prominent, var(--dsw-shadow-lv3, 0 16px 36px rgba(0, 0, 0, 0.3)));
+        box-shadow: var(--dsw-elevation-modal, 0 16px 36px rgba(0, 0, 0, 0.28));
         overflow: hidden;
-        display: flex;
-        flex-direction: column;
-        box-sizing: border-box;
-        font-family: var(--dsw-font-family, inherit);
+        color: var(--dsw-alias-label-primary);
       }
       .dsh-ssh-modal-header {
-        padding: 14px 18px;
-        border-bottom: .5px solid var(--dsw-alias-border-l4);
         display: flex;
         align-items: center;
         justify-content: space-between;
-        background: var(--dsw-alias-bg-layer-1);
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--dsw-alias-border-l2);
       }
       .dsh-ssh-modal-title {
-        font-weight: 600;
-        font-size: 14px;
-        color: var(--dsw-alias-label-primary);
         display: flex;
         align-items: center;
         gap: 8px;
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--dsw-alias-label-primary);
       }
       .dsh-ssh-modal-close {
-        background: transparent;
-        border: none;
-        color: var(--dsw-alias-label-secondary);
-        cursor: pointer;
-        width: 26px;
-        height: 26px;
+        width: 24px;
+        height: 24px;
         border-radius: 6px;
-        display: flex;
+        border: none;
+        background: transparent;
+        color: var(--dsw-alias-label-tertiary);
+        cursor: pointer;
+        display: inline-flex;
         align-items: center;
         justify-content: center;
         padding: 0;
-        transition: background-color 0.15s ease;
+        transition: color 0.15s, background-color 0.15s;
       }
       .dsh-ssh-modal-close:hover {
         background: var(--dsw-alias-interactive-bg-hover);
@@ -355,38 +616,46 @@ function initSidebarButton() {
         display: block;
         font-size: 13px;
         font-weight: 500;
-        color: var(--dsw-alias-label-primary) !important;
         margin-bottom: 6px;
+        color: var(--dsw-alias-label-primary);
       }
-      .dsh-ssh-input, .dsh-ssh-select {
+      .dsh-ssh-input {
         width: 100%;
+        box-sizing: border-box;
         height: 34px;
         padding: 0 10px;
         border-radius: 8px;
-        border: .5px solid var(--dsw-alias-border-l4) !important;
-        background: var(--dsw-alias-bg-layer-1) !important;
+        border: 1px solid var(--dsw-alias-border-l2) !important;
+        background: var(--dsw-alias-bg-module-platform) !important;
         color: var(--dsw-alias-label-primary) !important;
         font-size: 13px;
-        box-sizing: border-box;
         outline: none;
-        transition: border-color 0.15s ease;
+        transition: border-color 0.15s;
       }
-      .dsh-ssh-input:focus, .dsh-ssh-select:focus {
-        border-color: var(--dsw-alias-brand-primary) !important;
+      .dsh-ssh-input:focus {
+        border-color: var(--dsw-alias-state-business-primary) !important;
       }
-      .dsh-ssh-input::placeholder {
-        color: var(--dsw-alias-label-dimmed) !important;
-      }
-      .dsh-ssh-select option {
-        background: var(--dsw-alias-bg-base) !important;
+      .dsh-ssh-select {
+        box-sizing: border-box;
+        height: 34px;
+        padding: 0 10px;
+        border-radius: 8px;
+        border: 1px solid var(--dsw-alias-border-l2) !important;
+        background: var(--dsw-alias-bg-module-platform) !important;
         color: var(--dsw-alias-label-primary) !important;
+        font-size: 13px;
+        outline: none;
+        cursor: pointer;
+      }
+      .dsh-ssh-select:focus {
+        border-color: var(--dsw-alias-state-business-primary) !important;
       }
       .dsh-ssh-btn-secondary {
         height: 34px;
         padding: 0 14px;
         border-radius: 8px;
-        border: .5px solid var(--dsw-alias-border-l4) !important;
-        background: var(--dsw-alias-bg-layer-1) !important;
+        border: 1px solid var(--dsw-alias-border-l1) !important;
+        background: var(--dsw-alias-bg-base) !important;
         color: var(--dsw-alias-label-primary) !important;
         font-size: 13px;
         font-weight: 500;

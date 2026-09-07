@@ -1,6 +1,6 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { parseSshConfig } from './config'
-import { runSsh, remoteReadFile, remoteWriteFile, shellQuote } from './connection'
+import { runSsh, remoteReadFile, remoteWriteFile, shellQuote, hasHostPassword } from './connection'
 import { findRemoteWorkspaceMeta } from './workspace'
 
 /** Helper to ensure returned objects are strictly lossless JSON (stripping undefined keys) */
@@ -60,6 +60,22 @@ function resolveContext(ctx: any, args: { host?: string; path?: string }, exec: 
   return { host, remoteRoot, resolvedPath, isRemoteWorkspace: !!remoteInfo }
 }
 
+function checkToolAuth(ctx: any, host: string, exec: any) {
+  const sessionCwd = resolveSessionCwd(ctx, exec)
+  const remoteInfo = findRemoteWorkspaceMeta(sessionCwd)
+  if (remoteInfo && remoteInfo.meta.host === host && remoteInfo.meta.authType === 'password') {
+    if (!hasHostPassword(host)) {
+      return {
+        ok: false,
+        needAuth: true,
+        host,
+        error: `远程主机 ${host} 内存密码已过期，请在网页端弹出的密码框中确认后重试。`
+      }
+    }
+  }
+  return null
+}
+
 export function registerTools(ctx: any) {
   const register = (tool: any) => ctx.tools.register(defineTool(tool))
 
@@ -108,6 +124,9 @@ export function registerTools(ctx: any) {
         })
       }
 
+      const authErr = checkToolAuth(ctx, host, exec)
+      if (authErr) return toCleanJson(authErr)
+
       const execDir = args.cwd || remoteRoot
       let cmd = String(args.command || '').trim()
       if (execDir) {
@@ -145,6 +164,9 @@ export function registerTools(ctx: any) {
       if (!host) return toCleanJson({ ok: false, error: '未指定 host，且当前会话不是远程工作区' })
       if (!resolvedPath) return toCleanJson({ ok: false, error: 'path 不能为空' })
 
+      const authErr = checkToolAuth(ctx, host, exec)
+      if (authErr) return toCleanJson(authErr)
+
       const r = await remoteReadFile(host, resolvedPath)
       if (!r.ok) return toCleanJson({ ok: false, error: r.error || '读取失败' })
       return toCleanJson({
@@ -175,6 +197,9 @@ export function registerTools(ctx: any) {
       const { host, resolvedPath } = resolveContext(ctx, args, exec)
       if (!host) return toCleanJson({ ok: false, error: '未指定 host，且当前会话不是远程工作区' })
       if (!resolvedPath) return toCleanJson({ ok: false, error: 'path 不能为空' })
+
+      const authErr = checkToolAuth(ctx, host, exec)
+      if (authErr) return toCleanJson(authErr)
 
       const r = await remoteWriteFile(host, resolvedPath, args.content ?? '')
       return toCleanJson({
