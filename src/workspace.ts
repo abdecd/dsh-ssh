@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, chmodSync, realpathSync } from 'node:fs'
 import { join, dirname, basename, resolve, sep, posix } from 'node:path'
 import { homedir } from 'node:os'
-import { setHostPassword } from './connection'
+import { setHostPassword, closeSshConnection } from './connection'
 
 export interface RemoteWorkspaceMeta {
   host: string
@@ -32,10 +32,9 @@ export function getWorkspacesDir(): string {
  */
 export function findRemoteWorkspaceMeta(startPath?: string): { meta: RemoteWorkspaceMeta; anchorDir: string } | null {
   if (!startPath) return null
-  let current = startPath
-  const root = dirname(current)
+  let current = resolve(startPath)
 
-  while (current && current !== root) {
+  while (current) {
     const metaPath = join(current, '.remote-ssh.json')
     if (existsSync(metaPath)) {
       try {
@@ -55,6 +54,7 @@ export function findRemoteWorkspaceMeta(startPath?: string): { meta: RemoteWorks
 /**
  * Translate a local path in the anchor workspace to the remote absolute path.
  * Hardened against path traversal attacks (../ escapes).
+ * Throws on path traversal attempts outside workspace boundaries.
  */
 export function localToRemotePath(localPath: string, anchorDir: string, remoteRoot: string): string {
   if (!localPath) return remoteRoot
@@ -63,13 +63,17 @@ export function localToRemotePath(localPath: string, anchorDir: string, remoteRo
   const normAnchor = posix.normalize(anchorDir.replace(/\\/g, '/'))
   const cleanBase = posix.normalize(remoteRoot.replace(/\\/g, '/'))
 
-  let rel = ''
   if (normLocal === normAnchor) {
     return cleanBase
   }
 
-  if (normLocal.startsWith(normAnchor.endsWith('/') ? normAnchor : normAnchor + '/')) {
-    rel = normLocal.slice(normAnchor.length).replace(/^\/+/, '')
+  let rel = ''
+  const anchorWithSlash = normAnchor.endsWith('/') ? normAnchor : normAnchor + '/'
+
+  if (normLocal.startsWith(anchorWithSlash)) {
+    rel = normLocal.slice(anchorWithSlash.length)
+  } else if (!normLocal.startsWith('/')) {
+    rel = normLocal
   } else {
     rel = posix.relative(normAnchor, normLocal)
   }
@@ -80,8 +84,12 @@ export function localToRemotePath(localPath: string, anchorDir: string, remoteRo
   const candidate = posix.resolve(cleanBase, rel)
 
   // Containment check: candidate must stay within cleanBase
-  if (cleanBase !== '/' && !candidate.startsWith(cleanBase.endsWith('/') ? cleanBase : cleanBase + '/') && candidate !== cleanBase) {
-    return cleanBase
+  const baseWithSlash = cleanBase.endsWith('/') ? cleanBase : cleanBase + '/'
+  const isWithin = candidate === cleanBase || candidate.startsWith(baseWithSlash)
+
+  // If candidate escapes cleanBase, or relative path escapes via ../, reject immediately
+  if (!isWithin || rel.startsWith('../') || rel === '..') {
+    throw new Error(`路径遍历拦截：拒绝访问超出远程工作区的路径 "${localPath}"`)
   }
 
   return candidate
@@ -150,6 +158,18 @@ export async function createRemoteWorkspace(
   }
 }
 
+function tryCleanWorkspaceConnection(anchorDir: string): void {
+  try {
+    const metaPath = join(anchorDir, '.remote-ssh.json')
+    if (existsSync(metaPath)) {
+      const meta = JSON.parse(readFileSync(metaPath, 'utf8')) as RemoteWorkspaceMeta
+      if (meta && meta.host) {
+        closeSshConnection(meta.host).catch(() => {})
+      }
+    }
+  } catch {}
+}
+
 /**
  * Delete a remote workspace anchor and unregister from DSH.
  * Strict whitelist enforcement: anchorDir must strictly reside under getWorkspacesDir()
@@ -175,6 +195,7 @@ export async function deleteRemoteWorkspace(
       }
     }
     if (existsSync(target)) {
+      tryCleanWorkspaceConnection(target)
       rmSync(target, { recursive: true, force: true })
     }
     return { ok: true }
@@ -193,7 +214,9 @@ export function hookWorkspaceRegistryDeletion(ctx: any): void {
 
   reg.__dshSshHooked = true
   const originalDelete = reg.delete.bind(reg)
-  const wsBaseDir = getWorkspacesDir().toLowerCase()
+  const wsBaseDir = resolve(getWorkspacesDir()).toLowerCase()
+  const sep = (process.platform === 'win32' ? '\\' : '/').toLowerCase()
+  const prefixWithSep = wsBaseDir.endsWith(sep) ? wsBaseDir : wsBaseDir + sep
 
   reg.delete = async function (id: any) {
     let anchorToRemove: string | null = null
@@ -201,10 +224,11 @@ export function hookWorkspaceRegistryDeletion(ctx: any): void {
       const entity = typeof reg.get === 'function' ? reg.get(id) : null
       if (entity && entity.path) {
         const p = String(entity.path)
-        let canon = p.toLowerCase()
-        try { canon = realpathSync(p).toLowerCase() } catch { }
-        if (canon.startsWith(wsBaseDir) || p.toLowerCase().startsWith(wsBaseDir)) {
-          anchorToRemove = p
+        const resolvedPath = resolve(p)
+        let canon = resolvedPath.toLowerCase()
+        try { canon = realpathSync(resolvedPath).toLowerCase() } catch { }
+        if (canon.startsWith(prefixWithSep) && canon !== wsBaseDir) {
+          anchorToRemove = resolvedPath
         }
       }
     } catch { }
@@ -214,6 +238,7 @@ export function hookWorkspaceRegistryDeletion(ctx: any): void {
     if (anchorToRemove) {
       try {
         if (existsSync(anchorToRemove)) {
+          tryCleanWorkspaceConnection(anchorToRemove)
           rmSync(anchorToRemove, { recursive: true, force: true })
           console.log('[dsh-ssh] Removed anchor directory on workspace deletion:', anchorToRemove)
         }

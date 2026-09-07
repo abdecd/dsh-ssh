@@ -4,6 +4,7 @@ import {
   parseSshConfig,
   isValidSshHost,
   localToRemotePath,
+  findRemoteWorkspaceMeta,
   setHostPassword,
   getHostPassword,
   hasHostPassword,
@@ -11,7 +12,9 @@ import {
   deleteRemoteWorkspace,
   getWorkspacesDir,
   runSsh,
-  remoteBrowseDirs
+  remoteBrowseDirs,
+  isSafeRequest,
+  shellCd
 } from '../lib/index.js'
 
 test('parseSshConfig correctly parses ~/.ssh/config', () => {
@@ -201,16 +204,75 @@ test('localToRemotePath prevents path traversal escapes', () => {
   const anchor = '/home/user/.dsh/dsh-ssh/workspaces/ws-123'
   const remote = '/data/project/my-app'
 
-  // Malicious path traversal attempts escaping remote root
+  // Malicious path traversal attempts escaping remote root must throw security error
   const malicious1 = '/home/user/.dsh/dsh-ssh/workspaces/ws-123/../../../../../../etc/shadow'
-  assert.equal(localToRemotePath(malicious1, anchor, remote), remote)
+  assert.throws(() => localToRemotePath(malicious1, anchor, remote), /路径遍历拦截/)
 
   const malicious2 = '../../../../../../etc/passwd'
-  assert.equal(localToRemotePath(malicious2, anchor, remote), remote)
+  assert.throws(() => localToRemotePath(malicious2, anchor, remote), /路径遍历拦截/)
 
   // Normal nested subpaths remain intact
   const safeSub = '/home/user/.dsh/dsh-ssh/workspaces/ws-123/sub/file.txt'
   assert.equal(localToRemotePath(safeSub, anchor, remote), '/data/project/my-app/sub/file.txt')
+})
+
+test('findRemoteWorkspaceMeta correctly resolves deep subdirectories', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+
+  const tempDir = path.join(os.tmpdir(), `dsh-deep-find-${Date.now()}`)
+  const deepDir = path.join(tempDir, 'src', 'components', 'modals', 'nested')
+  fs.mkdirSync(deepDir, { recursive: true })
+
+  const metaContent = {
+    host: 'test-remote-host',
+    remotePath: '/var/www/project'
+  }
+  fs.writeFileSync(path.join(tempDir, '.remote-ssh.json'), JSON.stringify(metaContent), 'utf8')
+
+  try {
+    // Calling findRemoteWorkspaceMeta from deep directory must find the ancestor anchor
+    const found = findRemoteWorkspaceMeta(deepDir)
+    assert(found, 'must find meta from deep nested subdirectory')
+    assert.equal(found.meta.host, 'test-remote-host')
+    assert.equal(found.meta.remotePath, '/var/www/project')
+    assert.equal(found.anchorDir, tempDir)
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true })
+  }
+})
+
+test('isSafeRequest blocks cross-origin attacks while allowing local loopback', () => {
+  // Cross-site fetch must be blocked
+  assert.equal(isSafeRequest({ headers: { 'sec-fetch-site': 'cross-site' } }), false)
+
+  // Disallowed form submission or text simple requests
+  assert.equal(isSafeRequest({ headers: { 'content-type': 'application/x-www-form-urlencoded' } }), false)
+  assert.equal(isSafeRequest({ headers: { 'content-type': 'multipart/form-data' } }), false)
+
+  // Untrusted external origin
+  assert.equal(isSafeRequest({ headers: { origin: 'http://attacker.com' } }), false)
+  assert.equal(isSafeRequest({ headers: { referer: 'https://evil.org/hack' } }), false)
+
+  // Trusted local origins
+  assert.equal(isSafeRequest({ headers: { origin: 'http://localhost:3080' } }), true)
+  assert.equal(isSafeRequest({ headers: { origin: 'http://127.0.0.1:3080' } }), true)
+  assert.equal(isSafeRequest({ headers: { host: 'my-dsh.internal:3080', origin: 'http://my-dsh.internal:3080' } }), true)
+
+  // Non-browser local callers (empty origin)
+  assert.equal(isSafeRequest({ headers: {} }), true)
+})
+
+test('shellCd correctly handles ~ home directory expansion', () => {
+  assert.equal(shellCd('~'), 'cd "$HOME" 2>/dev/null || cd ~ 2>/dev/null || cd')
+  assert.equal(shellCd(''), 'cd "$HOME" 2>/dev/null || cd ~ 2>/dev/null || cd')
+
+  const sub = shellCd('~/my project/src')
+  assert(sub.startsWith('cd "$HOME"/\'my project/src\''), 'subpath must keep $HOME unquoted for expansion')
+
+  const abs = shellCd('/var/log/nginx')
+  assert.equal(abs, "cd '/var/log/nginx' 2>/dev/null")
 })
 
 test('deleteRemoteWorkspace enforces strict anchor directory whitelist', async () => {

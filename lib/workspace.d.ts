@@ -17,6 +17,7 @@ export declare function findRemoteWorkspaceMeta(startPath?: string): {
 /**
  * Translate a local path in the anchor workspace to the remote absolute path.
  * Hardened against path traversal attacks (../ escapes).
+ * Throws on path traversal attempts outside workspace boundaries.
  */
 export declare function localToRemotePath(localPath: string, anchorDir: string, remoteRoot: string): string;
 /**

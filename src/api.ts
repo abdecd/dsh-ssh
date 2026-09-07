@@ -1,8 +1,38 @@
 import { parseSshConfig, isValidSshHost } from './config'
 import { testSshConnection, setHostPassword, remoteBrowseDirs } from './connection'
 import { createRemoteWorkspace } from './workspace'
+import { isSafeRequest } from './interceptor'
 
 const MAX_BODY_BYTES = 1024 * 1024 // 1MB
+
+// Simple in-memory brute force protection
+const failedAttempts = new Map<string, { count: number; lockedUntil: number }>()
+
+function checkRateLimit(host: string): string | null {
+  const record = failedAttempts.get(host)
+  if (!record) return null
+  if (record.lockedUntil > Date.now()) {
+    const remaining = Math.ceil((record.lockedUntil - Date.now()) / 1000)
+    return `认证失败次数过多，为防止目标主机账户被锁定，请在 ${remaining} 秒后重试`
+  }
+  if (record.lockedUntil <= Date.now() && record.count >= 5) {
+    failedAttempts.delete(host)
+  }
+  return null
+}
+
+function recordAttemptResult(host: string, success: boolean) {
+  if (success) {
+    failedAttempts.delete(host)
+    return
+  }
+  const current = failedAttempts.get(host) || { count: 0, lockedUntil: 0 }
+  current.count += 1
+  if (current.count >= 5) {
+    current.lockedUntil = Date.now() + 30000 // 30s lockout
+  }
+  failedAttempts.set(host, current)
+}
 
 async function readJson(req: any): Promise<any> {
   const chunks: Buffer[] = []
@@ -33,9 +63,23 @@ export function registerApiRoutes(ctx: any) {
         const method = url.pathname.slice('/dsh-ssh/api/'.length).replace(/\/+$/, '')
 
         try {
+          if (!isSafeRequest(req)) {
+            sendJson(res, 403, { ok: false, error: '跨站或非法请求源被拦截 (Cross-site request blocked)' })
+            return
+          }
+
           if (method === 'hosts') {
-            const hosts = parseSshConfig()
-            sendJson(res, 200, { ok: true, hosts })
+            const rawHosts = parseSshConfig()
+            const sanitizedHosts = rawHosts.map((h) => ({
+              host: h.host,
+              hostName: h.hostName,
+              user: h.user,
+              port: h.port,
+              hasIdentityFile: Boolean(h.identityFile),
+              proxyJump: h.proxyJump,
+              passwordAuthentication: h.passwordAuthentication
+            }))
+            sendJson(res, 200, { ok: true, hosts: sanitizedHosts })
             return
           }
 
@@ -56,7 +100,13 @@ export function registerApiRoutes(ctx: any) {
               sendJson(res, 400, { ok: false, error: 'host and password are required' })
               return
             }
+            const rateErr = checkRateLimit(body.host)
+            if (rateErr) {
+              sendJson(res, 429, { ok: false, error: rateErr })
+              return
+            }
             const r = await testSshConnection(body.host, body.password)
+            recordAttemptResult(body.host, r.ok)
             if (r.ok) {
               setHostPassword(body.host, body.password)
               sendJson(res, 200, { ok: true, message: '认证成功' })
@@ -71,7 +121,13 @@ export function registerApiRoutes(ctx: any) {
               sendJson(res, 400, { ok: false, error: 'host is required' })
               return
             }
+            const rateErr = checkRateLimit(body.host)
+            if (rateErr) {
+              sendJson(res, 429, { ok: false, error: rateErr })
+              return
+            }
             const r = await testSshConnection(body.host, body.password)
+            recordAttemptResult(body.host, r.ok)
             sendJson(res, 200, r)
             return
           }

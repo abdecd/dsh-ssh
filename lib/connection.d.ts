@@ -31,6 +31,11 @@ export declare function setHostPassword(host: string, pass?: string): void;
 export declare function getHostPassword(host: string): string | undefined;
 export declare function hasHostPassword(host: string): boolean;
 export declare function removeHostPassword(host: string): void;
+/**
+ * Gracefully close the OpenSSH ControlMaster connection for host,
+ * and clear stored credentials.
+ */
+export declare function closeSshConnection(host: string): Promise<void>;
 export declare function shellQuote(p: string): string;
 /**
  * Generate a safe cd command that correctly expands ~ (tilde) to $HOME
@@ -56,6 +61,7 @@ export declare function remoteListDir(host: string, remotePath: string, localDis
 export declare function remoteReadFile(host: string, remotePath: string): Promise<FsReadResult>;
 /**
  * Atomically write content to a remote file.
+ * Writes to a unique temp file and atomically renames via mv to avoid file truncation on abort.
  */
 export declare function remoteWriteFile(host: string, remotePath: string, content: string | Buffer): Promise<{
     ok: boolean;

@@ -10,6 +10,47 @@ import {
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024 // 10MB
 
+/**
+ * CSRF / Origin validation for HTTP endpoints.
+ * Blocks cross-site malicious requests while allowing same-origin and local loopback clients.
+ */
+export function isSafeRequest(req: any): boolean {
+  const headers = req.headers || {}
+  const secFetchSite = headers['sec-fetch-site']
+  if (secFetchSite === 'cross-site') {
+    return false
+  }
+
+  const ct = (headers['content-type'] || '').toLowerCase()
+  if (ct.includes('form') || ct.includes('multipart') || (ct.startsWith('text/') && !ct.includes('json'))) {
+    return false
+  }
+
+  const origin = headers['origin'] || headers['referer']
+  if (!origin) {
+    return true
+  }
+
+  try {
+    const originUrl = new URL(origin)
+    const hostHeader = headers['host'] || ''
+    const reqHost = hostHeader.split(':')[0]?.toLowerCase()
+    const originHost = originUrl.hostname.toLowerCase()
+
+    if (originHost === 'localhost' || originHost === '127.0.0.1' || originHost === '::1' || originHost === '[::1]') {
+      return true
+    }
+
+    if (reqHost && originHost === reqHost) {
+      return true
+    }
+
+    return false
+  } catch {
+    return false
+  }
+}
+
 /** Read raw buffer and parse JSON request body */
 async function readRawBody(req: any): Promise<{ buffer: Buffer; payload: any }> {
   const chunks: Buffer[] = []
@@ -93,6 +134,11 @@ export function registerFsInterceptors(ctx: any) {
             return
           }
 
+          if (!isSafeRequest(req)) {
+            writeJson(res, 403, { ok: false, error: { code: 'forbidden', message: '跨站或非法请求源被拦截 (Cross-site request blocked)' } })
+            return
+          }
+
           let raw: { buffer: Buffer; payload: any }
           try {
             raw = await readRawBody(req)
@@ -147,45 +193,50 @@ export function registerFsInterceptors(ctx: any) {
                 return false
               }
 
-              if (method === 'fs.tree') {
-                const targetLocal = payload.path || activeCwd || anchorDir
-                const remoteTarget = localToRemotePath(targetLocal, anchorDir, meta.remotePath)
-                const result = await remoteListDir(meta.host, remoteTarget, targetLocal)
-                if (handleAuthError(result)) return
-                if (result.ok && result.data) {
-                  writeOk(res, result.data)
-                } else {
-                  writeError(res, 400, result.error)
+              try {
+                if (method === 'fs.tree') {
+                  const targetLocal = payload.path || activeCwd || anchorDir
+                  const remoteTarget = localToRemotePath(targetLocal, anchorDir, meta.remotePath)
+                  const result = await remoteListDir(meta.host, remoteTarget, targetLocal)
+                  if (handleAuthError(result)) return
+                  if (result.ok && result.data) {
+                    writeOk(res, result.data)
+                  } else {
+                    writeError(res, 400, result.error)
+                  }
+                } else if (method === 'fs.read') {
+                  const targetLocal = payload.path
+                  const remoteTarget = localToRemotePath(targetLocal, anchorDir, meta.remotePath)
+                  const result = await remoteReadFile(meta.host, remoteTarget)
+                  if (handleAuthError(result)) return
+                  if (result.ok) {
+                    writeOk(res, result)
+                  } else {
+                    writeError(res, 400, result.error)
+                  }
+                } else if (method === 'fs.write') {
+                  const targetLocal = payload.path
+                  const remoteTarget = localToRemotePath(targetLocal, anchorDir, meta.remotePath)
+                  const result = await remoteWriteFile(meta.host, remoteTarget, payload.content || '')
+                  if (handleAuthError(result)) return
+                  if (result.ok) {
+                    writeOk(res, { ok: true })
+                  } else {
+                    writeError(res, 400, result.error)
+                  }
+                } else if (method === 'fs.search') {
+                  const targetLocal = activeCwd || anchorDir
+                  const result = await remoteSearchFiles(meta.host, meta.remotePath, targetLocal, payload.query || '')
+                  if (handleAuthError(result)) return
+                  if (result.ok) {
+                    writeOk(res, { entries: result.entries, truncated: result.truncated })
+                  } else {
+                    writeError(res, 400, result.error)
+                  }
                 }
-              } else if (method === 'fs.read') {
-                const targetLocal = payload.path
-                const remoteTarget = localToRemotePath(targetLocal, anchorDir, meta.remotePath)
-                const result = await remoteReadFile(meta.host, remoteTarget)
-                if (handleAuthError(result)) return
-                if (result.ok) {
-                  writeOk(res, result)
-                } else {
-                  writeError(res, 400, result.error)
-                }
-              } else if (method === 'fs.write') {
-                const targetLocal = payload.path
-                const remoteTarget = localToRemotePath(targetLocal, anchorDir, meta.remotePath)
-                const result = await remoteWriteFile(meta.host, remoteTarget, payload.content || '')
-                if (handleAuthError(result)) return
-                if (result.ok) {
-                  writeOk(res, { ok: true })
-                } else {
-                  writeError(res, 400, result.error)
-                }
-              } else if (method === 'fs.search') {
-                const targetLocal = activeCwd || anchorDir
-                const result = await remoteSearchFiles(meta.host, meta.remotePath, targetLocal, payload.query || '')
-                if (handleAuthError(result)) return
-                if (result.ok) {
-                  writeOk(res, { entries: result.entries, truncated: result.truncated })
-                } else {
-                  writeError(res, 400, result.error)
-                }
+              } catch (traversalErr: any) {
+                writeJson(res, 403, { ok: false, error: { code: 'forbidden', message: traversalErr?.message || '访问被拒绝：超出远程工作区范围' } })
+                return
               }
             } else {
               // ==========================================

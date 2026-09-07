@@ -65,6 +65,30 @@ export function removeHostPassword(host: string): void {
   memoryPasswords.delete(host)
 }
 
+/**
+ * Gracefully close the OpenSSH ControlMaster connection for host,
+ * and clear stored credentials.
+ */
+export async function closeSshConnection(host: string): Promise<void> {
+  removeHostPassword(host)
+  if (!isValidSshHost(host)) return
+
+  const socketDir = getSocketDir()
+  const socketPath = join(socketDir, '%r@%h:%p')
+
+  await new Promise<void>((resolve) => {
+    const child = spawn('ssh', ['-O', 'exit', '-o', `ControlPath=${socketPath}`, '--', host], {
+      stdio: 'ignore'
+    })
+    child.on('close', () => resolve())
+    child.on('error', () => resolve())
+    setTimeout(() => {
+      try { child.kill('SIGKILL') } catch {}
+      resolve()
+    }, 3000)
+  })
+}
+
 function getSocketDir(): string {
   const dir = join(homedir(), '.dsh', 'dsh-ssh', 'sockets')
   if (!existsSync(dir)) {
@@ -407,14 +431,21 @@ export async function remoteReadFile(
     return cached
   }
 
-  // Stat file size first and base64 stream
+  // Stat file size first, verify within MAX_BYTES to prevent truncation corruption, then base64 stream
   const script = `( [ -f ${shellQuote(remotePath)} ] || { echo '__DSH_ERR_NOT_FOUND__'; exit 1; }; ` +
+    `SIZE=$(wc -c < ${shellQuote(remotePath)} 2>/dev/null || stat -c %s ${shellQuote(remotePath)} 2>/dev/null || echo 0); ` +
+    `if [ "$SIZE" -gt ${MAX_BYTES} ]; then echo "__DSH_ERR_TOO_LARGE__:$SIZE"; exit 1; fi; ` +
     `base64 < ${shellQuote(remotePath)} 2>/dev/null )`
 
   const r = await runSsh(host, script)
   if (!r.ok) {
     if (r.stdout.includes('__DSH_ERR_NOT_FOUND__')) {
       return { ok: false, error: `远程文件不存在: ${remotePath}` }
+    }
+    if (r.stdout.includes('__DSH_ERR_TOO_LARGE__')) {
+      const match = r.stdout.match(/__DSH_ERR_TOO_LARGE__:(\d+)/)
+      const sizeStr = match ? ` (${Math.round(Number(match[1]) / (1024 * 1024))}MB)` : ''
+      return { ok: false, error: `远程文件过大${sizeStr}，超过 10MB 限制。为防止截断导致后续保存损坏文件，已拒绝读取。` }
     }
     return { ok: false, error: r.error || r.stderr || '读取文件失败' }
   }
@@ -438,7 +469,7 @@ export async function remoteReadFile(
       kind: 'binary',
       size: buffer.length,
       head: buffer.subarray(0, Math.min(buffer.length, 4096)).toString('base64'),
-      truncated: buffer.length > MAX_BYTES
+      truncated: false
     }
   } else {
     result = {
@@ -446,7 +477,7 @@ export async function remoteReadFile(
       kind: 'text',
       size: buffer.length,
       content: buffer.toString('utf8'),
-      truncated: buffer.length > MAX_BYTES
+      truncated: false
     }
   }
 
@@ -456,6 +487,7 @@ export async function remoteReadFile(
 
 /**
  * Atomically write content to a remote file.
+ * Writes to a unique temp file and atomically renames via mv to avoid file truncation on abort.
  */
 export async function remoteWriteFile(
   host: string,
@@ -467,7 +499,11 @@ export async function remoteWriteFile(
     : Buffer.from(String(content), 'utf8').toString('base64')
 
   const dirname = remotePath.split('/').slice(0, -1).join('/') || '.'
-  const script = `mkdir -p ${shellQuote(dirname)} && base64 -d > ${shellQuote(remotePath)}`
+  const tmpPath = `${remotePath}.dsh-tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const script = `mkdir -p ${shellQuote(dirname)} && ` +
+    `base64 -d > ${shellQuote(tmpPath)} && ` +
+    `mv -f ${shellQuote(tmpPath)} ${shellQuote(remotePath)} || ` +
+    `{ rm -f ${shellQuote(tmpPath)} 2>/dev/null; exit 1; }`
 
   const r = await runSsh(host, script, b64)
   invalidateCache(host, remotePath)

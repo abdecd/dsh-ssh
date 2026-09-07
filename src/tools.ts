@@ -1,7 +1,7 @@
 import { posix } from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { parseSshConfig, isValidSshHost } from './config'
-import { runSsh, remoteReadFile, remoteWriteFile, shellQuote, hasHostPassword } from './connection'
+import { runSsh, remoteReadFile, remoteWriteFile, shellQuote, shellCd, hasHostPassword } from './connection'
 import { findRemoteWorkspaceMeta } from './workspace'
 
 /** Helper to ensure returned objects are strictly lossless JSON (stripping undefined keys) */
@@ -47,6 +47,17 @@ function resolveSessionCwd(ctx: any, exec: any): string | undefined {
 function resolveContext(ctx: any, args: { host?: string; path?: string }, exec: any) {
   const sessionCwd = resolveSessionCwd(ctx, exec)
   const remoteInfo = findRemoteWorkspaceMeta(sessionCwd)
+
+  // Host isolation: If inside a remote workspace, prevent executing against another host
+  if (remoteInfo && args.host && args.host.toLowerCase() !== remoteInfo.meta.host.toLowerCase()) {
+    return {
+      host: null,
+      remoteRoot: remoteInfo.meta.remotePath,
+      resolvedPath: null,
+      error: `工作区隔离拒绝：当前会话绑定远程主机 "${remoteInfo.meta.host}"，禁止跨主机向 "${args.host}" 执行操作`
+    }
+  }
+
   const host = args.host || remoteInfo?.meta.host
   const remoteRoot = remoteInfo?.meta.remotePath || '/'
 
@@ -63,13 +74,25 @@ function resolveContext(ctx: any, args: { host?: string; path?: string }, exec: 
     resolvedPath = remoteRoot
   }
 
-  if (remoteInfo && resolvedPath && !resolvedPath.startsWith('~')) {
-    const cleanBase = posix.normalize(remoteRoot.replace(/\\/g, '/'))
-    const normTarget = posix.normalize(resolvedPath.replace(/\\/g, '/'))
-    if (cleanBase !== '/' && !normTarget.startsWith(cleanBase.endsWith('/') ? cleanBase : cleanBase + '/') && normTarget !== cleanBase) {
-      return { host, remoteRoot, resolvedPath: null, error: `路径遍历拦截：禁止访问超出远程工作区目录的路径: "${resolvedPath}"` }
+  if (resolvedPath) {
+    // Block any path escaping via ..
+    const normCheck = posix.normalize(resolvedPath.replace(/\\/g, '/'))
+    if (normCheck.startsWith('../') || normCheck === '..') {
+      return { host, remoteRoot, resolvedPath: null, error: `路径遍历拦截：禁止使用 ".." 访问越权路径: "${args.path}"` }
     }
-    resolvedPath = normTarget
+
+    if (remoteInfo) {
+      if (resolvedPath.startsWith('~') && !remoteRoot.startsWith('~')) {
+        return { host, remoteRoot, resolvedPath: null, error: `路径拦截：当前工作区目录限制在 "${remoteRoot}"，禁止跨越到用户家目录: "${args.path}"` }
+      }
+      const cleanBase = posix.normalize(remoteRoot.replace(/\\/g, '/'))
+      const normTarget = posix.normalize(resolvedPath.replace(/\\/g, '/'))
+      const baseWithSlash = cleanBase.endsWith('/') ? cleanBase : cleanBase + '/'
+      if (cleanBase !== '/' && !normTarget.startsWith(baseWithSlash) && normTarget !== cleanBase) {
+        return { host, remoteRoot, resolvedPath: null, error: `路径遍历拦截：禁止访问超出远程工作区目录的路径: "${resolvedPath}"` }
+      }
+      resolvedPath = normTarget
+    }
   }
 
   return { host, remoteRoot, resolvedPath, isRemoteWorkspace: !!remoteInfo, error: null }
@@ -154,7 +177,7 @@ export function registerTools(ctx: any) {
       const execDir = args.cwd || remoteRoot
       let cmd = String(args.command || '').trim()
       if (execDir) {
-        cmd = `cd ${shellQuote(execDir)} 2>/dev/null; ${cmd}`
+        cmd = `${shellCd(execDir)}; ${cmd}`
       }
 
       const r = await runSsh(host, cmd)
