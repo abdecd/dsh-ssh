@@ -161,7 +161,7 @@ export function RemoteFolderBrowserModal({
               disabled={loading || currentPath === '/'}
               className="dsh-ssh-btn-secondary"
               title="返回上一级"
-              style={{ height: 32, padding: '0 10px', fontSize: '12px', flexShrink: 0 }}
+              style={{ height: 32, padding: '0 10px', fontSize: '12px', flexShrink: 0, whiteSpace: 'nowrap' }}
             >
               ⬆ 上一级
             </button>
@@ -170,7 +170,7 @@ export function RemoteFolderBrowserModal({
               value={inputPath}
               onChange={(e) => setInputPath(e.target.value)}
               className="dsh-ssh-input"
-              style={{ height: 32, fontSize: '12px', flex: 1 }}
+              style={{ height: 32, fontSize: '12px', flex: 1, minWidth: 0 }}
               placeholder="输入绝对路径按回车前往，如 /var/www"
             />
             <button
@@ -179,7 +179,7 @@ export function RemoteFolderBrowserModal({
               disabled={loading}
               className="dsh-ssh-btn-secondary"
               title="刷新"
-              style={{ height: 32, padding: '0 10px', fontSize: '12px', flexShrink: 0 }}
+              style={{ height: 32, padding: '0 10px', fontSize: '12px', flexShrink: 0, whiteSpace: 'nowrap' }}
             >
               {loading ? '...' : '前往'}
             </button>
@@ -255,20 +255,21 @@ export function RemoteFolderBrowserModal({
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
-          backgroundColor: 'var(--dsw-alias-bg-module-platform)'
+          backgroundColor: 'var(--dsw-alias-bg-module-platform)',
+          gap: '8px'
         }}>
-          <div style={{ fontSize: '12px', color: 'var(--dsw-alias-label-secondary)', maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          <div style={{ fontSize: '12px', color: 'var(--dsw-alias-label-secondary)', minWidth: 0, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             已选: <strong style={{ color: 'var(--dsw-alias-label-primary)' }}>{currentPath}</strong>
           </div>
-          <div style={{ display: 'flex', gap: '8px' }}>
-            <button type="button" onClick={onClose} className="dsh-ssh-btn-secondary" style={{ height: 32, fontSize: '12px' }}>
+          <div style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
+            <button type="button" onClick={onClose} className="dsh-ssh-btn-secondary" style={{ height: 32, fontSize: '12px', flexShrink: 0, whiteSpace: 'nowrap' }}>
               取消
             </button>
             <button
               type="button"
               onClick={handleConfirm}
               className="dsh-ssh-btn-primary"
-              style={{ height: 32, fontSize: '12px' }}
+              style={{ height: 32, fontSize: '12px', flexShrink: 0, whiteSpace: 'nowrap' }}
             >
               ✓ 选择此目录
             </button>
@@ -445,7 +446,7 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
           </div>
 
           {/* Form Body */}
-          <form onSubmit={handleSubmit} style={{ padding: '20px 22px' }}>
+          <form onSubmit={handleSubmit} className="dsh-ssh-modal-body">
           {/* Hidden username input to enable browser credential management */}
           <input
             type="text"
@@ -482,7 +483,7 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
                 value={selectedHost}
                 onChange={(e) => handleHostChange(e.target.value)}
                 className="dsh-ssh-select"
-                style={{ flex: 1 }}
+                style={{ flex: 1, minWidth: 0 }}
               >
                 {hosts.map((h) => (
                   <option key={h.host} value={h.host}>
@@ -496,6 +497,7 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
                 onClick={handleTest}
                 disabled={testing}
                 className="dsh-ssh-btn-secondary"
+                style={{ flexShrink: 0, whiteSpace: 'nowrap' }}
               >
                 {testing ? '测试中...' : '测试连接'}
               </button>
@@ -551,14 +553,14 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
                 placeholder="例如: /root/code/my-app 或 /home/ubuntu/project"
                 value={remotePath}
                 onChange={(e) => setRemotePath(e.target.value)}
-                style={{ flex: 1 }}
+                style={{ flex: 1, minWidth: 0 }}
               />
               <button
                 type="button"
                 onClick={handleOpenBrowser}
                 className="dsh-ssh-btn-secondary"
                 title="浏览远程服务器目录"
-                style={{ whiteSpace: 'nowrap' }}
+                style={{ flexShrink: 0, whiteSpace: 'nowrap' }}
               >
                 <span>浏览...</span>
               </button>
@@ -696,7 +698,7 @@ export function ReAuthModal({
           </button>
         </div>
 
-        <form onSubmit={handleSubmit} style={{ padding: '20px 22px' }}>
+        <form onSubmit={handleSubmit} className="dsh-ssh-modal-body">
           <input
             type="text"
             name="username"
@@ -900,6 +902,7 @@ function initSidebarButton() {
         animation: dshSshFadeIn 0.12s cubic-bezier(0.16, 1, 0.3, 1);
       }
       .dsh-ssh-modal-card {
+        box-sizing: border-box;
         width: 480px;
         max-width: min(520px, 92vw);
         background: var(--dsw-alias-bg-base) !important;
@@ -908,6 +911,25 @@ function initSidebarButton() {
         box-shadow: var(--dsw-elevation-modal, 0 16px 36px rgba(0, 0, 0, 0.28));
         overflow: hidden;
         color: var(--dsw-alias-label-primary);
+      }
+      .dsh-ssh-modal-card *,
+      .dsh-ssh-modal-card *::before,
+      .dsh-ssh-modal-card *::after {
+        box-sizing: border-box;
+      }
+      .dsh-ssh-modal-body {
+        padding: 20px 22px;
+      }
+      @media (max-width: 480px) {
+        .dsh-ssh-modal-card {
+          max-width: 95vw;
+        }
+        .dsh-ssh-modal-body {
+          padding: 16px 16px;
+        }
+        .dsh-ssh-modal-header {
+          padding: 12px 16px !important;
+        }
       }
       .dsh-ssh-modal-header {
         display: flex;
@@ -937,6 +959,7 @@ function initSidebarButton() {
         justify-content: center;
         padding: 0;
         transition: color 0.15s, background-color 0.15s;
+        flex-shrink: 0;
       }
       .dsh-ssh-modal-close:hover {
         background: var(--dsw-alias-interactive-bg-hover);
@@ -951,6 +974,7 @@ function initSidebarButton() {
       }
       .dsh-ssh-input {
         width: 100%;
+        min-width: 0;
         box-sizing: border-box;
         height: 34px;
         padding: 0 10px;
@@ -966,6 +990,8 @@ function initSidebarButton() {
         border-color: var(--dsw-alias-state-business-primary) !important;
       }
       .dsh-ssh-select {
+        min-width: 0;
+        max-width: 100%;
         box-sizing: border-box;
         height: 34px;
         padding: 0 10px;
@@ -976,6 +1002,9 @@ function initSidebarButton() {
         font-size: 13px;
         outline: none;
         cursor: pointer;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        overflow: hidden;
       }
       .dsh-ssh-select:focus {
         border-color: var(--dsw-alias-state-business-primary) !important;
@@ -994,6 +1023,8 @@ function initSidebarButton() {
         align-items: center;
         justify-content: center;
         transition: background-color 0.15s ease;
+        white-space: nowrap;
+        flex-shrink: 0;
       }
       .dsh-ssh-btn-secondary:hover:not(:disabled) {
         background: var(--dsw-alias-interactive-bg-hover) !important;
@@ -1012,6 +1043,8 @@ function initSidebarButton() {
         align-items: center;
         justify-content: center;
         transition: background-color 0.15s ease;
+        white-space: nowrap;
+        flex-shrink: 0;
       }
       .dsh-ssh-btn-primary:hover:not(:disabled) {
         background: var(--dsw-alias-button-primary-hover) !important;
