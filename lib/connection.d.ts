@@ -75,3 +75,15 @@ export declare function testSshConnection(host: string, password?: string): Prom
     ok: boolean;
     message: string;
 }>;
+export interface RemoteBrowseResult {
+    ok: boolean;
+    currentPath?: string;
+    dirs?: string[];
+    truncated?: boolean;
+    error?: string;
+}
+/**
+ * Safely browse remote directories for workspace creation folder picker.
+ * Bounded to 200 directories and strips hidden folders.
+ */
+export declare function remoteBrowseDirs(host: string, targetPath?: string): Promise<RemoteBrowseResult>;

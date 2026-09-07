@@ -1,4 +1,12 @@
 import React from 'react';
+export declare function RemoteFolderBrowserModal({ isOpen, onClose, onSelect, host, initialPath, password }: {
+    isOpen: boolean;
+    onClose: () => void;
+    onSelect: (selectedPath: string) => void;
+    host: string;
+    initialPath?: string;
+    password?: string;
+}): React.ReactPortal | null;
 export declare function AddRemoteModal({ isOpen, onClose }: {
     isOpen: boolean;
     onClose: () => void;

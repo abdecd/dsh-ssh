@@ -10,7 +10,8 @@ import {
   removeHostPassword,
   deleteRemoteWorkspace,
   getWorkspacesDir,
-  runSsh
+  runSsh,
+  remoteBrowseDirs
 } from '../lib/index.js'
 
 test('parseSshConfig correctly parses ~/.ssh/config', () => {
@@ -310,4 +311,25 @@ test('registerFsInterceptors passes through local workspace requests to original
   assert.equal(passedThrough, true, 'local workspace request must be passed through to original handler')
   assert.deepEqual(receivedPayload, { path: '/local/test.txt' }, 'payload must be preserved and replayed')
 })
+
+test('remoteBrowseDirs blocks dangerous characters and unvalidated hosts', async () => {
+  // 1. Invalid path characters (newlines, null bytes) must be blocked
+  const res1 = await remoteBrowseDirs('orangepi', '/tmp/foo\nrm -rf /')
+  assert.equal(res1.ok, false)
+  assert(res1.error?.includes('非法路径字符'))
+
+  const res2 = await remoteBrowseDirs('orangepi', '/tmp/foo\0bar')
+  assert.equal(res2.ok, false)
+  assert(res2.error?.includes('非法路径字符'))
+
+  // 2. Unconfigured / malicious hosts must be rejected immediately by host validation
+  const res3 = await remoteBrowseDirs('-oProxyCommand=evil', '/var/www')
+  assert.equal(res3.ok, false)
+  assert(res3.error?.includes('主机校验失败'))
+
+  const res4 = await remoteBrowseDirs('non-existent-host-xyz', '/var/www')
+  assert.equal(res4.ok, false)
+  assert(res4.error?.includes('主机校验失败'))
+})
+
 

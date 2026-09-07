@@ -515,3 +515,64 @@ export async function testSshConnection(host: string, password?: string): Promis
   }
   return { ok: false, message: r.error || r.stderr || '连接失败' }
 }
+
+export interface RemoteBrowseResult {
+  ok: boolean
+  currentPath?: string
+  dirs?: string[]
+  truncated?: boolean
+  error?: string
+}
+
+/**
+ * Safely browse remote directories for workspace creation folder picker.
+ * Bounded to 200 directories and strips hidden folders.
+ */
+export async function remoteBrowseDirs(
+  host: string,
+  targetPath = '~'
+): Promise<RemoteBrowseResult> {
+  const p = targetPath.trim() || '~'
+  if (/[\r\n\0]/.test(p)) {
+    return { ok: false, error: '非法路径字符' }
+  }
+
+  const script =
+    `( cd ${shellQuote(p)} 2>/dev/null || { echo '__DSH_ERR_CD__'; exit 1; }; ` +
+    `pwd -P; ` +
+    `echo '__DSH_SEP__'; ` +
+    `{ find . -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f\\n' 2>/dev/null || ls -1dp */ 2>/dev/null; } | sort -f | head -n 201 )`
+
+  const r = await runSsh(host, script, undefined, 8000)
+  if (!r.ok) {
+    if (r.stdout.includes('__DSH_ERR_CD__')) {
+      return { ok: false, error: `无法访问该远程目录（不存在或无权限）: ${p}` }
+    }
+    return { ok: false, error: r.error || r.stderr || '读取远程目录失败' }
+  }
+
+  const parts = r.stdout.split('__DSH_SEP__')
+  const absPath = parts[0]?.trim() || p
+  const rawLines = (parts[1] || '').split(/\r?\n/)
+  const dirSet = new Set<string>()
+
+  for (const line of rawLines) {
+    let name = line.trim()
+    if (!name || name === '.' || name === '..' || name === './') continue
+    if (name.endsWith('/')) name = name.slice(0, -1)
+    if (name.startsWith('.')) continue
+    dirSet.add(name)
+  }
+
+  const rawDirs = Array.from(dirSet)
+  const truncated = rawDirs.length > 200
+  const dirs = rawDirs.slice(0, 200)
+
+  return {
+    ok: true,
+    currentPath: absPath,
+    dirs,
+    truncated
+  }
+}
+

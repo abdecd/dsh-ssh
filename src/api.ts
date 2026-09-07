@@ -1,5 +1,5 @@
 import { parseSshConfig, isValidSshHost } from './config'
-import { testSshConnection, setHostPassword } from './connection'
+import { testSshConnection, setHostPassword, remoteBrowseDirs } from './connection'
 import { createRemoteWorkspace } from './workspace'
 
 const MAX_BODY_BYTES = 1024 * 1024 // 1MB
@@ -73,6 +73,19 @@ export function registerApiRoutes(ctx: any) {
             }
             const r = await testSshConnection(body.host, body.password)
             sendJson(res, 200, r)
+            return
+          }
+
+          if (method === 'browse') {
+            if (!body.host) {
+              sendJson(res, 400, { ok: false, error: 'host is required' })
+              return
+            }
+            if (body.password) {
+              setHostPassword(body.host, body.password)
+            }
+            const r = await remoteBrowseDirs(body.host, body.path || '~')
+            sendJson(res, r.ok ? 200 : 400, r)
             return
           }
 
