@@ -20,12 +20,14 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
   const [selectedHost, setSelectedHost] = useState('')
   const [remotePath, setRemotePath] = useState('')
   const [title, setTitle] = useState('')
-  const [usePassword, setUsePassword] = useState(false)
   const [password, setPassword] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
+
+  const currentHost = hosts.find((h) => h.host === selectedHost)
+  const isPasswordAuth = Boolean(currentHost?.passwordAuthentication)
 
   useEffect(() => {
     if (isOpen) {
@@ -37,11 +39,7 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
         .then((res) => {
           if (res.ok && res.hosts?.length > 0) {
             setHosts(res.hosts)
-            const first = res.hosts[0]
-            setSelectedHost(first.host)
-            if (first.passwordAuthentication) {
-              setUsePassword(true)
-            }
+            setSelectedHost(res.hosts[0].host)
           }
         })
         .catch(() => {})
@@ -53,10 +51,7 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
   const handleHostChange = (newHost: string) => {
     setSelectedHost(newHost)
     setTestResult(null)
-    const match = hosts.find((h) => h.host === newHost)
-    if (match?.passwordAuthentication) {
-      setUsePassword(true)
-    }
+    setPassword('')
   }
 
   const handleTest = async () => {
@@ -69,7 +64,7 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           host: selectedHost,
-          password: usePassword ? password : undefined
+          password: isPasswordAuth ? password : undefined
         })
       }).then((r) => r.json())
       setTestResult({ ok: res.ok, msg: res.message || (res.ok ? '连接成功' : '连接失败') })
@@ -86,8 +81,8 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
       setErrorMsg('请选择主机并填写远程项目绝对路径')
       return
     }
-    if (usePassword && !password) {
-      setErrorMsg('已勾选密码登录，请输入密码')
+    if (isPasswordAuth && !password) {
+      setErrorMsg('当前主机配置为密码登录，请输入 SSH 登录密码')
       return
     }
 
@@ -101,8 +96,8 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
           host: selectedHost,
           remotePath: remotePath.trim(),
           title: title.trim() || undefined,
-          authType: usePassword ? 'password' : 'key',
-          password: usePassword ? password : undefined
+          authType: isPasswordAuth ? 'password' : 'key',
+          password: isPasswordAuth ? password : undefined
         })
       }).then((r) => r.json())
 
@@ -215,31 +210,12 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
               </button>
             </div>
 
-            <label
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: '6px',
-                fontSize: '12px',
-                cursor: 'pointer',
-                marginTop: '8px',
-                color: 'var(--dsw-alias-label-secondary)'
-              }}
-            >
-              <input
-                type="checkbox"
-                checked={usePassword}
-                onChange={(e) => setUsePassword(e.target.checked)}
-              />
-              <span>使用密码登录 (Password Authentication)</span>
-            </label>
-
-            {usePassword && (
-              <div style={{ marginTop: '10px' }}>
+            {isPasswordAuth && (
+              <div style={{ marginTop: '12px' }}>
                 <label className="dsh-ssh-label">
                   SSH 登录密码 <span style={{ color: 'var(--dsw-alias-state-error-primary, #cf222e)' }}>*</span>
                   <span style={{ fontWeight: 'normal', color: 'var(--dsw-alias-label-tertiary)', marginLeft: 6 }}>
-                    (由浏览器保管，后端仅存内存不落盘)
+                    (检测到 PasswordAuthentication，密码由浏览器保管)
                   </span>
                 </label>
                 <input
@@ -310,7 +286,7 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
             </button>
             <button
               type="submit"
-              disabled={submitting || !remotePath.trim() || (usePassword && !password)}
+              disabled={submitting || !remotePath.trim() || (isPasswordAuth && !password)}
               className="dsh-ssh-btn-primary"
             >
               {submitting ? '创建中...' : '创建工作区'}
