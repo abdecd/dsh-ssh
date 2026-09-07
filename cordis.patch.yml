@@ -1,0 +1,16 @@
+# dsh-ssh bundle patch
+- insert:
+    - id: dsh-ssh
+      name: 'dsh-ssh'
+
+# Configure better-sidebar to use dsh-ssh shell wrapper for remote terminals
+- id: better-sidebar
+  config:
+    shell: !!js |
+      (() => {
+        var homedir = process.env.USERPROFILE || process.env.HOME || ((process.env.HOMEDRIVE || '') + (process.env.HOMEPATH || ''));
+        var isWin = process.platform === 'win32';
+        var sep = isWin ? '\\' : '/';
+        var dir = homedir + sep + '.dsh' + sep + 'dsh-ssh';
+        return isWin ? dir + sep + 'dsh-remote-shell.cmd' : dir + sep + 'dsh-remote-shell';
+      })()

@@ -1,0 +1,45 @@
+export interface RemoteWorkspaceMeta {
+    host: string;
+    remotePath: string;
+    title?: string;
+    createdAt: number;
+}
+export declare function getBaseDir(): string;
+export declare function getWorkspacesDir(): string;
+/**
+ * Scan upwards from path to find .remote-ssh.json
+ */
+export declare function findRemoteWorkspaceMeta(startPath?: string): {
+    meta: RemoteWorkspaceMeta;
+    anchorDir: string;
+} | null;
+/**
+ * Translate a local path in the anchor workspace to the remote absolute path.
+ */
+export declare function localToRemotePath(localPath: string, anchorDir: string, remoteRoot: string): string;
+/**
+ * Create a new remote workspace anchor and register it into DSH workspaceRegistry.
+ */
+export declare function createRemoteWorkspace(workspaceRegistry: any, host: string, remotePath: string, customTitle?: string): Promise<{
+    ok: boolean;
+    workspaceId?: string;
+    anchorDir?: string;
+    title?: string;
+    error?: string;
+}>;
+/**
+ * Delete a remote workspace anchor and unregister from DSH.
+ */
+export declare function deleteRemoteWorkspace(workspaceRegistry: any, anchorDir: string): Promise<{
+    ok: boolean;
+    error?: string;
+}>;
+/**
+ * Hook workspaceRegistry.delete to immediately delete the corresponding anchor directory
+ * in ~/.dsh/dsh-ssh/workspaces/ when a workspace is removed.
+ */
+export declare function hookWorkspaceRegistryDeletion(ctx: any): void;
+/**
+ * Install the shell wrapper script for dsh-better-sidebar terminal integration.
+ */
+export declare function ensureShellWrapper(): void;
