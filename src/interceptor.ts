@@ -1,6 +1,3 @@
-import { opendir, stat, readFile, writeFile, rename, mkdir, rm, readdir } from 'node:fs/promises'
-import { join, dirname } from 'node:path'
-import { homedir } from 'node:os'
 import { findRemoteWorkspaceMeta, localToRemotePath } from './workspace'
 import {
   remoteListDir,
@@ -13,8 +10,8 @@ import {
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024 // 10MB
 
-/** Read and parse JSON request body */
-async function readJsonBody(req: any): Promise<any> {
+/** Read raw buffer and parse JSON request body */
+async function readRawBody(req: any): Promise<{ buffer: Buffer; payload: any }> {
   const chunks: Buffer[] = []
   let total = 0
   for await (const chunk of req) {
@@ -25,9 +22,43 @@ async function readJsonBody(req: any): Promise<any> {
     }
     chunks.push(buf)
   }
-  const text = Buffer.concat(chunks).toString('utf8')
-  if (!text.trim()) return {}
-  return JSON.parse(text)
+  const buffer = Buffer.concat(chunks)
+  const text = buffer.toString('utf8')
+  const payload = text.trim() ? JSON.parse(text) : {}
+  return { buffer, payload }
+}
+
+/** Replay the consumed request stream for downstream handlers */
+function replayRequest(req: any, buffer: Buffer): any {
+  return new Proxy(req, {
+    get(target, prop, receiver) {
+      if (prop === Symbol.asyncIterator) {
+        return async function* () {
+          yield buffer
+        }
+      }
+      const val = Reflect.get(target, prop, receiver)
+      if (typeof val === 'function') {
+        return val.bind(target)
+      }
+      return val
+    }
+  })
+}
+
+/** Find the underlying prefix route handler registered on webServer (e.g. dsh-better-sidebar) */
+function getOriginalPrefixHandler(ctx: any, pathname: string) {
+  const ws = ctx.webServer
+  if (!ws || !ws.prefixes) return null
+  let best: any = undefined
+  for (const [prefix, route] of ws.prefixes) {
+    if (pathname === prefix || pathname.startsWith(`${prefix}/`)) {
+      if (best === undefined || prefix.length > best.path.length) {
+        best = route
+      }
+    }
+  }
+  return best?.handler
 }
 
 function writeJson(res: any, status: number, body: unknown): void {
@@ -42,92 +73,6 @@ function writeOk(res: any, value: unknown): void {
 
 function writeError(res: any, status = 400, message = 'operation failed'): void {
   writeJson(res, status, { ok: false, error: { code: 'fs-error', message } })
-}
-
-// ---------------------------------------------------------------------------
-// Local FS Fallback Implementations (for local workspaces)
-// ---------------------------------------------------------------------------
-
-async function localListDir(targetPath: string) {
-  const dir = targetPath || homedir()
-  const level = await opendir(dir)
-  const entries: any[] = []
-  for await (const dirent of level) {
-    if (entries.length >= 1000) break
-    const isDir = dirent.isDirectory()
-    const isSymlink = dirent.isSymbolicLink()
-    entries.push({
-      name: dirent.name,
-      path: join(dir, dirent.name),
-      isDir,
-      isSymlink,
-      broken: false,
-      hidden: dirent.name.startsWith('.')
-    })
-  }
-  entries.sort((a, b) => {
-    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
-    return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
-  })
-  return { path: dir, entries, truncated: entries.length >= 1000 }
-}
-
-async function localReadText(filePath: string) {
-  const s = await stat(filePath)
-  if (s.isDirectory()) throw new Error('is a directory')
-  const buffer = await readFile(filePath)
-  const probe = buffer.subarray(0, Math.min(buffer.length, 8000))
-  if (probe.includes(0)) {
-    return {
-      kind: 'binary',
-      size: s.size,
-      head: probe.subarray(0, Math.min(probe.length, 4096)).toString('base64'),
-      truncated: false
-    }
-  }
-  return {
-    kind: 'text',
-    content: buffer.toString('utf8'),
-    truncated: false
-  }
-}
-
-async function localWriteText(filePath: string, content: string) {
-  const tmp = `${filePath}.dsh-ssh-tmp-${process.pid}`
-  try {
-    await mkdir(dirname(filePath), { recursive: true })
-    await writeFile(tmp, content, 'utf8')
-    await rename(tmp, filePath)
-    return { ok: true }
-  } catch (err) {
-    await rm(tmp, { force: true }).catch(() => {})
-    throw err
-  }
-}
-
-async function localSearch(rootDir: string, query: string) {
-  if (!query) return { entries: [], truncated: false }
-  const q = query.toLowerCase()
-  const entries: any[] = []
-
-  async function walk(dir: string, depth: number) {
-    if (depth > 6 || entries.length >= 300) return
-    try {
-      const items = await readdir(dir, { withFileTypes: true })
-      for (const item of items) {
-        if (item.name.toLowerCase().includes(q)) {
-          entries.push({ path: join(dir, item.name), isDir: item.isDirectory() })
-          if (entries.length >= 300) return
-        }
-        if (item.isDirectory() && !item.name.startsWith('.') && item.name !== 'node_modules') {
-          await walk(join(dir, item.name), depth + 1)
-        }
-      }
-    } catch {}
-  }
-
-  await walk(rootDir, 0)
-  return { entries, truncated: entries.length >= 300 }
 }
 
 // ---------------------------------------------------------------------------
@@ -148,13 +93,15 @@ export function registerFsInterceptors(ctx: any) {
             return
           }
 
-          let payload: any = {}
+          let raw: { buffer: Buffer; payload: any }
           try {
-            payload = await readJsonBody(req)
+            raw = await readRawBody(req)
           } catch (e: any) {
             writeJson(res, 400, { ok: false, error: { code: 'bad-request', message: e?.message || 'invalid json' } })
             return
           }
+
+          const payload = raw.payload
 
           try {
             // Determine active working directory / path
@@ -172,7 +119,7 @@ export function registerFsInterceptors(ctx: any) {
 
             if (remoteInfo) {
               // ==========================================
-              // REMOTE WORKSPACE
+              // REMOTE WORKSPACE: Handled by dsh-ssh
               // ==========================================
               const { meta, anchorDir } = remoteInfo
 
@@ -242,23 +189,17 @@ export function registerFsInterceptors(ctx: any) {
               }
             } else {
               // ==========================================
-              // LOCAL WORKSPACE FALLBACK
+              // LOCAL WORKSPACE: Transparent pass-through to original route handler
               // ==========================================
-              if (method === 'fs.tree') {
-                const target = payload.path || activeCwd
-                const result = await localListDir(target)
-                writeOk(res, result)
-              } else if (method === 'fs.read') {
-                const result = await localReadText(payload.path)
-                writeOk(res, result)
-              } else if (method === 'fs.write') {
-                const result = await localWriteText(payload.path, payload.content || '')
-                writeOk(res, result)
-              } else if (method === 'fs.search') {
-                const target = activeCwd || homedir()
-                const result = await localSearch(target, payload.query || '')
-                writeOk(res, result)
+              const originalHandler = getOriginalPrefixHandler(ctx, `/sidebar/api/${method}`)
+              if (typeof originalHandler === 'function') {
+                await originalHandler(replayRequest(req, raw.buffer), res)
+                return
               }
+              writeJson(res, 404, {
+                ok: false,
+                error: { code: 'not-found', message: 'No underlying handler registered for local workspace route' }
+              })
             }
           } catch (err: any) {
             writeError(res, 400, err?.message || String(err))

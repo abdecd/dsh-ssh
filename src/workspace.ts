@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, chmodSync, realpathSync } from 'node:fs'
-import { join, dirname, basename } from 'node:path'
+import { join, dirname, basename, resolve, sep, posix } from 'node:path'
 import { homedir } from 'node:os'
 import { setHostPassword } from './connection'
 
@@ -54,25 +54,37 @@ export function findRemoteWorkspaceMeta(startPath?: string): { meta: RemoteWorks
 
 /**
  * Translate a local path in the anchor workspace to the remote absolute path.
+ * Hardened against path traversal attacks (../ escapes).
  */
 export function localToRemotePath(localPath: string, anchorDir: string, remoteRoot: string): string {
   if (!localPath) return remoteRoot
 
-  const normLocal = localPath.replace(/\\/g, '/')
-  const normAnchor = anchorDir.replace(/\\/g, '/')
+  const normLocal = posix.normalize(localPath.replace(/\\/g, '/'))
+  const normAnchor = posix.normalize(anchorDir.replace(/\\/g, '/'))
+  const cleanBase = posix.normalize(remoteRoot.replace(/\\/g, '/'))
 
   let rel = ''
-  if (normLocal.toLowerCase().startsWith(normAnchor.toLowerCase())) {
-    rel = normLocal.slice(normAnchor.length)
-  } else {
-    rel = normLocal.replace(/^[A-Za-z]:/, '').replace(/^\/+/, '')
+  if (normLocal === normAnchor) {
+    return cleanBase
   }
 
-  rel = rel.replace(/^\/+/, '')
-  if (!rel) return remoteRoot
+  if (normLocal.startsWith(normAnchor.endsWith('/') ? normAnchor : normAnchor + '/')) {
+    rel = normLocal.slice(normAnchor.length).replace(/^\/+/, '')
+  } else {
+    rel = posix.relative(normAnchor, normLocal)
+  }
 
-  const cleanBase = remoteRoot.replace(/\/+$/, '')
-  return `${cleanBase}/${rel}`
+  if (!rel || rel === '.') return cleanBase
+
+  // Resolve target path against cleanBase
+  const candidate = posix.resolve(cleanBase, rel)
+
+  // Containment check: candidate must stay within cleanBase
+  if (cleanBase !== '/' && !candidate.startsWith(cleanBase.endsWith('/') ? cleanBase : cleanBase + '/') && candidate !== cleanBase) {
+    return cleanBase
+  }
+
+  return candidate
 }
 
 /**
@@ -140,20 +152,30 @@ export async function createRemoteWorkspace(
 
 /**
  * Delete a remote workspace anchor and unregister from DSH.
+ * Strict whitelist enforcement: anchorDir must strictly reside under getWorkspacesDir()
+ * and cannot be the workspaces directory itself.
  */
 export async function deleteRemoteWorkspace(
   workspaceRegistry: any,
   anchorDir: string
 ): Promise<{ ok: boolean; error?: string }> {
   try {
+    const wsDir = resolve(getWorkspacesDir())
+    const target = resolve(anchorDir)
+
+    // Strict containment check: target must be inside wsDir and not wsDir itself
+    if (!target.startsWith(wsDir + sep) || target === wsDir) {
+      return { ok: false, error: '权限拒绝：只能删除位于 workspaces 目录下的远程工作区锚点目录' }
+    }
+
     if (workspaceRegistry && typeof workspaceRegistry.resolveByPath === 'function') {
-      const entity = await workspaceRegistry.resolveByPath(anchorDir)
+      const entity = await workspaceRegistry.resolveByPath(target)
       if (entity && typeof workspaceRegistry.delete === 'function') {
         await workspaceRegistry.delete(entity.id)
       }
     }
-    if (existsSync(anchorDir)) {
-      rmSync(anchorDir, { recursive: true, force: true })
+    if (existsSync(target)) {
+      rmSync(target, { recursive: true, force: true })
     }
     return { ok: true }
   } catch (err: any) {
@@ -216,6 +238,11 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 
+function shellQuote(str) {
+  if (!str) return "''";
+  return "'" + String(str).replace(/'/g, "'\\\\''") + "'";
+}
+
 let cur = process.cwd();
 let meta = null;
 const root = path.dirname(cur);
@@ -231,15 +258,19 @@ while (cur && cur !== root) {
   cur = parent;
 }
 
-if (meta && meta.host) {
-  const host = meta.host;
+if (meta && meta.host && typeof meta.host === 'string') {
+  const host = meta.host.trim();
+  if (!/^[a-zA-Z0-9_.-]+$/.test(host) || host.startsWith('-')) {
+    console.error('[dsh-ssh] 非法或不安全的 SSH 主机名: ' + host);
+    process.exit(1);
+  }
   const remotePath = meta.remotePath;
   let remoteCmd = undefined;
   if (remotePath) {
-    remoteCmd = 'cd ' + JSON.stringify(remotePath) + ' 2>/dev/null; exec \${SHELL:-/bin/bash} -l';
+    remoteCmd = 'cd ' + shellQuote(remotePath) + ' 2>/dev/null; exec \${SHELL:-/bin/bash} -l';
   }
   const socketPath = path.join(require('os').homedir(), '.dsh', 'dsh-ssh', 'sockets', '%r@%h:%p');
-  const args = ['-o', 'ControlMaster=auto', '-o', 'ControlPath=' + socketPath, '-tt', host];
+  const args = ['-o', 'ControlMaster=auto', '-o', 'ControlPath=' + socketPath, '-tt', '--', host];
   if (remoteCmd) args.push(remoteCmd);
 
   const child = spawn('ssh', args, { stdio: 'inherit' });

@@ -38,7 +38,7 @@ export function parseSshConfig(customPath?: string): SshHostEntry[] {
       const value = parts.slice(1).join(' ').trim()
 
       if (key === 'host') {
-        const aliases = parts.slice(1).filter((a) => a && !a.includes('*') && !a.includes('?'))
+        const aliases = parts.slice(1).filter((a) => a && !a.includes('*') && !a.includes('?') && !a.startsWith('-'))
         currentEntries = []
         for (const alias of aliases) {
           const entry: SshHostEntry = { host: alias }
@@ -65,3 +65,18 @@ export function parseSshConfig(customPath?: string): SshHostEntry[] {
     return []
   }
 }
+
+/**
+ * Validate that a host string is a safe, RFC-compliant hostname
+ * and is present in ~/.ssh/config.
+ */
+export function isValidSshHost(host: string, customPath?: string): boolean {
+  if (!host || typeof host !== 'string') return false
+  const clean = host.trim()
+  if (!clean || clean.startsWith('-') || !/^[a-zA-Z0-9_.-]+$/.test(clean)) {
+    return false
+  }
+  const validHosts = parseSshConfig(customPath)
+  return validHosts.some((h) => h.host.toLowerCase() === clean.toLowerCase())
+}
+

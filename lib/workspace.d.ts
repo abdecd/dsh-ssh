@@ -16,6 +16,7 @@ export declare function findRemoteWorkspaceMeta(startPath?: string): {
 } | null;
 /**
  * Translate a local path in the anchor workspace to the remote absolute path.
+ * Hardened against path traversal attacks (../ escapes).
  */
 export declare function localToRemotePath(localPath: string, anchorDir: string, remoteRoot: string): string;
 /**
@@ -30,6 +31,8 @@ export declare function createRemoteWorkspace(workspaceRegistry: any, host: stri
 }>;
 /**
  * Delete a remote workspace anchor and unregister from DSH.
+ * Strict whitelist enforcement: anchorDir must strictly reside under getWorkspacesDir()
+ * and cannot be the workspaces directory itself.
  */
 export declare function deleteRemoteWorkspace(workspaceRegistry: any, anchorDir: string): Promise<{
     ok: boolean;

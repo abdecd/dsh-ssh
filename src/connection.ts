@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process'
-import { mkdirSync, existsSync } from 'node:fs'
+import { mkdirSync, existsSync, chmodSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
+import { isValidSshHost } from './config'
 
 const MAX_BYTES = 10 * 1024 * 1024 // 10MB
 const CACHE_TTL_MS = 5000 // 5 seconds LRU cache
@@ -67,8 +68,11 @@ export function removeHostPassword(host: string): void {
 function getSocketDir(): string {
   const dir = join(homedir(), '.dsh', 'dsh-ssh', 'sockets')
   if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true })
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
   }
+  try {
+    chmodSync(dir, 0o700)
+  } catch {}
   return dir
 }
 
@@ -109,6 +113,16 @@ export async function runSsh(
   stdinData?: string | Buffer,
   timeoutMs = 30000
 ): Promise<SshRunResult> {
+  if (!isValidSshHost(host)) {
+    return {
+      ok: false,
+      exitCode: -1,
+      stdout: '',
+      stderr: '',
+      error: `SSH 主机校验失败：主机 "${host}" 不在合法 ~/.ssh/config 配置列表中或包含非法字符`
+    }
+  }
+
   const socketDir = getSocketDir()
   const socketPath = join(socketDir, '%r@%h:%p')
 
@@ -128,7 +142,7 @@ export async function runSsh(
     baseArgs.push('-o', 'BatchMode=yes')
   }
 
-  baseArgs.push(host, command)
+  baseArgs.push('--', host, command)
 
   let bin = 'ssh'
   let finalArgs = baseArgs
@@ -215,7 +229,7 @@ export async function runSsh(
 }
 
 // ---------------------------------------------------------------------------
-// In-Memory Cache (LRU + TTL)
+// In-Memory Cache (LRU + TTL, Bounded to 100 entries)
 // ---------------------------------------------------------------------------
 
 interface CacheItem<T> {
@@ -223,8 +237,33 @@ interface CacheItem<T> {
   timestamp: number
 }
 
+const MAX_CACHE_ENTRIES = 100
 const listCache = new Map<string, CacheItem<FsListing>>()
 const readCache = new Map<string, CacheItem<FsReadResult>>()
+
+function setCacheItem<T>(map: Map<string, CacheItem<T>>, key: string, data: T): void {
+  if (map.has(key)) {
+    map.delete(key)
+  } else if (map.size >= MAX_CACHE_ENTRIES) {
+    const oldestKey = map.keys().next().value
+    if (oldestKey !== undefined) {
+      map.delete(oldestKey)
+    }
+  }
+  map.set(key, { data, timestamp: Date.now() })
+}
+
+function getCacheItem<T>(map: Map<string, CacheItem<T>>, key: string): T | undefined {
+  const item = map.get(key)
+  if (!item) return undefined
+  if (Date.now() - item.timestamp > CACHE_TTL_MS) {
+    map.delete(key)
+    return undefined
+  }
+  map.delete(key)
+  map.set(key, item)
+  return item.data
+}
 
 export function invalidateCache(host?: string, remotePath?: string) {
   if (!host) {
@@ -254,20 +293,20 @@ export async function remoteListDir(
   localDisplayPath: string
 ): Promise<{ ok: boolean; data?: FsListing; error?: string }> {
   const cacheKey = `${host}|${remotePath}`
-  const cached = listCache.get(cacheKey)
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+  const cached = getCacheItem(listCache, cacheKey)
+  if (cached) {
     // Return cached listing with updated display path
     return {
       ok: true,
       data: {
         path: localDisplayPath,
-        entries: cached.data.entries.map((e) => ({
+        entries: cached.entries.map((e) => ({
           ...e,
           path: localDisplayPath.endsWith('/') || localDisplayPath.endsWith('\\')
             ? `${localDisplayPath}${e.name}`
             : `${localDisplayPath}/${e.name}`
         })),
-        truncated: cached.data.truncated
+        truncated: cached.truncated
       }
     }
   }
@@ -335,7 +374,7 @@ export async function remoteListDir(
     truncated: entries.length >= 1000
   }
 
-  listCache.set(cacheKey, { data: listing, timestamp: Date.now() })
+  setCacheItem(listCache, cacheKey, listing)
   return { ok: true, data: listing }
 }
 
@@ -347,9 +386,9 @@ export async function remoteReadFile(
   remotePath: string
 ): Promise<FsReadResult> {
   const cacheKey = `${host}|${remotePath}`
-  const cached = readCache.get(cacheKey)
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
-    return cached.data
+  const cached = getCacheItem(readCache, cacheKey)
+  if (cached) {
+    return cached
   }
 
   // Stat file size first and base64 stream
@@ -395,7 +434,7 @@ export async function remoteReadFile(
     }
   }
 
-  readCache.set(cacheKey, { data: result, timestamp: Date.now() })
+  setCacheItem(readCache, cacheKey, result)
   return result
 }
 

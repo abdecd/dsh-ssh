@@ -1,5 +1,6 @@
+import { posix } from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { parseSshConfig } from './config'
+import { parseSshConfig, isValidSshHost } from './config'
 import { runSsh, remoteReadFile, remoteWriteFile, shellQuote, hasHostPassword } from './connection'
 import { findRemoteWorkspaceMeta } from './workspace'
 
@@ -41,12 +42,17 @@ function resolveSessionCwd(ctx: any, exec: any): string | undefined {
 
 /**
  * Infer active host and remote root from execution context if user didn't specify.
+ * Hardened with host validation and remote path traversal check.
  */
 function resolveContext(ctx: any, args: { host?: string; path?: string }, exec: any) {
   const sessionCwd = resolveSessionCwd(ctx, exec)
   const remoteInfo = findRemoteWorkspaceMeta(sessionCwd)
   const host = args.host || remoteInfo?.meta.host
   const remoteRoot = remoteInfo?.meta.remotePath || '/'
+
+  if (host && !isValidSshHost(host)) {
+    return { host: null, remoteRoot, resolvedPath: null, error: `主机校验失败：主机 "${host}" 非法或不在 ~/.ssh/config 列表中` }
+  }
 
   let resolvedPath = args.path
   if (resolvedPath !== undefined && resolvedPath !== '') {
@@ -57,7 +63,16 @@ function resolveContext(ctx: any, args: { host?: string; path?: string }, exec: 
     resolvedPath = remoteRoot
   }
 
-  return { host, remoteRoot, resolvedPath, isRemoteWorkspace: !!remoteInfo }
+  if (remoteInfo && resolvedPath && !resolvedPath.startsWith('~')) {
+    const cleanBase = posix.normalize(remoteRoot.replace(/\\/g, '/'))
+    const normTarget = posix.normalize(resolvedPath.replace(/\\/g, '/'))
+    if (cleanBase !== '/' && !normTarget.startsWith(cleanBase.endsWith('/') ? cleanBase : cleanBase + '/') && normTarget !== cleanBase) {
+      return { host, remoteRoot, resolvedPath: null, error: `路径遍历拦截：禁止访问超出远程工作区目录的路径: "${resolvedPath}"` }
+    }
+    resolvedPath = normTarget
+  }
+
+  return { host, remoteRoot, resolvedPath, isRemoteWorkspace: !!remoteInfo, error: null }
 }
 
 function checkToolAuth(ctx: any, host: string, exec: any) {
@@ -113,7 +128,16 @@ export function registerTools(ctx: any) {
       render: textRender((_, v) => renderExec(v))
     },
     execute: async (args: any, exec: any) => {
-      const { host, remoteRoot } = resolveContext(ctx, args, exec)
+      const { host, remoteRoot, error: ctxErr } = resolveContext(ctx, args, exec)
+      if (ctxErr) {
+        return toCleanJson({
+          ok: false,
+          exitCode: -1,
+          stdout: '',
+          stderr: ctxErr,
+          error: ctxErr
+        })
+      }
       if (!host) {
         return toCleanJson({
           ok: false,
@@ -160,7 +184,8 @@ export function registerTools(ctx: any) {
       })
     },
     execute: async (args: any, exec: any) => {
-      const { host, resolvedPath } = resolveContext(ctx, args, exec)
+      const { host, resolvedPath, error: ctxErr } = resolveContext(ctx, args, exec)
+      if (ctxErr) return toCleanJson({ ok: false, error: ctxErr })
       if (!host) return toCleanJson({ ok: false, error: '未指定 host，且当前会话不是远程工作区' })
       if (!resolvedPath) return toCleanJson({ ok: false, error: 'path 不能为空' })
 
@@ -194,7 +219,8 @@ export function registerTools(ctx: any) {
       render: textRender((_, v) => v.ok ? '写入成功' : (v.error || '写入失败'))
     },
     execute: async (args: any, exec: any) => {
-      const { host, resolvedPath } = resolveContext(ctx, args, exec)
+      const { host, resolvedPath, error: ctxErr } = resolveContext(ctx, args, exec)
+      if (ctxErr) return toCleanJson({ ok: false, error: ctxErr })
       if (!host) return toCleanJson({ ok: false, error: '未指定 host，且当前会话不是远程工作区' })
       if (!resolvedPath) return toCleanJson({ ok: false, error: 'path 不能为空' })
 
