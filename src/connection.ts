@@ -81,6 +81,22 @@ export function shellQuote(p: string): string {
   return "'" + String(p).replace(/'/g, "'\\''") + "'"
 }
 
+/**
+ * Generate a safe cd command that correctly expands ~ (tilde) to $HOME
+ * while keeping all subpaths strictly POSIX shell quoted.
+ */
+export function shellCd(targetPath: string): string {
+  const p = String(targetPath || '').trim()
+  if (!p || p === '~' || p === '~/' || p === '~\\') {
+    return 'cd "$HOME" 2>/dev/null || cd ~ 2>/dev/null || cd'
+  }
+  if (p.startsWith('~/') || p.startsWith('~\\')) {
+    const sub = p.slice(2)
+    return `cd "$HOME"/${shellQuote(sub)} 2>/dev/null`
+  }
+  return `cd ${shellQuote(p)} 2>/dev/null`
+}
+
 function translateSshError(text: string): string {
   const t = String(text || '')
   if (/permission denied \(publickey,password/i.test(t)) {
@@ -312,7 +328,7 @@ export async function remoteListDir(
   }
 
   // Fast find printf command with fallback
-  const script = `( cd ${shellQuote(remotePath)} 2>/dev/null || { echo '__DSH_ERR_CD__'; exit 1; }; ` +
+  const script = `( ${shellCd(remotePath)} || { echo '__DSH_ERR_CD__'; exit 1; }; ` +
     `find . -maxdepth 1 -mindepth 1 -printf '%Y\\t%f\\t%s\\n' 2>/dev/null || ` +
     `ls -1ap 2>/dev/null )`
 
@@ -474,7 +490,7 @@ export async function remoteSearchFiles(
   if (!query) return { ok: true, entries: [], truncated: false }
 
   const q = `*${query}*`
-  const script = `( cd ${shellQuote(remotePath)} 2>/dev/null && ` +
+  const script = `( ${shellCd(remotePath)} && ` +
     `find . -maxdepth 5 -name ${shellQuote(q)} 2>/dev/null | head -n 300 )`
 
   const r = await runSsh(host, script)
@@ -538,7 +554,7 @@ export async function remoteBrowseDirs(
   }
 
   const script =
-    `( cd ${shellQuote(p)} 2>/dev/null || { echo '__DSH_ERR_CD__'; exit 1; }; ` +
+    `( ${shellCd(p)} || { echo '__DSH_ERR_CD__'; exit 1; }; ` +
     `pwd -P; ` +
     `echo '__DSH_SEP__'; ` +
     `{ find . -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f\\n' 2>/dev/null || ls -1dp */ 2>/dev/null; } | sort -f | head -n 201 )`

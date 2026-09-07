@@ -298,6 +298,9 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
       setErrorMsg(null)
       setTestResult(null)
       setPassword('')
+      setRemotePath('')
+      setTitle('')
+      setIsBrowserOpen(false)
       fetch('/dsh-ssh/api/hosts')
         .then((r) => r.json())
         .then((res) => {
@@ -532,9 +535,9 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
                 onClick={handleOpenBrowser}
                 className="dsh-ssh-btn-secondary"
                 title="浏览远程服务器目录"
-                style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', whiteSpace: 'nowrap' }}
+                style={{ whiteSpace: 'nowrap' }}
               >
-                <span>📂 浏览...</span>
+                <span>浏览...</span>
               </button>
             </div>
           </div>

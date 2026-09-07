@@ -33,6 +33,11 @@ export declare function hasHostPassword(host: string): boolean;
 export declare function removeHostPassword(host: string): void;
 export declare function shellQuote(p: string): string;
 /**
+ * Generate a safe cd command that correctly expands ~ (tilde) to $HOME
+ * while keeping all subpaths strictly POSIX shell quoted.
+ */
+export declare function shellCd(targetPath: string): string;
+/**
  * Execute a command on remote host via OpenSSH CLI with ControlMaster socket multiplexing.
  */
 export declare function runSsh(host: string, command: string, stdinData?: string | Buffer, timeoutMs?: number): Promise<SshRunResult>;
