@@ -165,14 +165,16 @@ export function RemoteFolderBrowserModal({
             >
               ⬆ 上一级
             </button>
-            <input
-              type="text"
-              value={inputPath}
-              onChange={(e) => setInputPath(e.target.value)}
-              className="dsh-ssh-input"
-              style={{ height: 32, fontSize: '12px', flex: 1, minWidth: 0 }}
-              placeholder="输入绝对路径按回车前往，如 /var/www"
-            />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <input
+                type="text"
+                value={inputPath}
+                onChange={(e) => setInputPath(e.target.value)}
+                className="dsh-ssh-input"
+                style={{ height: 32, fontSize: '12px', width: '100%', minWidth: 0, display: 'block' }}
+                placeholder="输入绝对路径按回车前往，如 /var/www"
+              />
+            </div>
             <button
               type="button"
               onClick={() => loadDirectory(inputPath)}
@@ -478,20 +480,22 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
             <label className="dsh-ssh-label">
               目标主机 <span style={{ fontWeight: 'normal', color: 'var(--dsw-alias-label-tertiary)' }}>(来自 ~/.ssh/config)</span>
             </label>
-            <div style={{ display: 'flex', gap: '8px' }}>
-              <select
-                value={selectedHost}
-                onChange={(e) => handleHostChange(e.target.value)}
-                className="dsh-ssh-select"
-                style={{ flex: 1, minWidth: 0 }}
-              >
-                {hosts.map((h) => (
-                  <option key={h.host} value={h.host}>
-                    {h.host} {h.hostName ? `(${h.user || 'user'}@${h.hostName})` : ''}
-                    {h.passwordAuthentication ? ' [密码登录]' : ''}
-                  </option>
-                ))}
-              </select>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
+                <select
+                  value={selectedHost}
+                  onChange={(e) => handleHostChange(e.target.value)}
+                  className="dsh-ssh-select"
+                  style={{ width: '100%', maxWidth: '100%', minWidth: 0, display: 'block' }}
+                >
+                  {hosts.map((h) => (
+                    <option key={h.host} value={h.host}>
+                      {h.host} {h.hostName ? `(${h.user || 'user'}@${h.hostName})` : ''}
+                      {h.passwordAuthentication ? ' [密码登录]' : ''}
+                    </option>
+                  ))}
+                </select>
+              </div>
               <button
                 type="button"
                 onClick={handleTest}
@@ -544,17 +548,19 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
             <label className="dsh-ssh-label">
               远程目录绝对路径 (Remote Path) <span style={{ color: 'var(--dsw-alias-state-error-primary, #cf222e)' }}>*</span>
             </label>
-            <div style={{ display: 'flex', gap: '8px' }}>
-              <input
-                type="text"
-                required
-                autoFocus
-                className="dsh-ssh-input"
-                placeholder="例如: /root/code/my-app 或 /home/ubuntu/project"
-                value={remotePath}
-                onChange={(e) => setRemotePath(e.target.value)}
-                style={{ flex: 1, minWidth: 0 }}
-              />
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <input
+                  type="text"
+                  required
+                  autoFocus
+                  className="dsh-ssh-input"
+                  placeholder="例如: /root/code/my-app 或 /home/ubuntu/project"
+                  value={remotePath}
+                  onChange={(e) => setRemotePath(e.target.value)}
+                  style={{ width: '100%', minWidth: 0, display: 'block' }}
+                />
+              </div>
               <button
                 type="button"
                 onClick={handleOpenBrowser}
@@ -922,13 +928,14 @@ function initSidebarButton() {
       }
       @media (max-width: 480px) {
         .dsh-ssh-modal-card {
-          max-width: 95vw;
+          width: 92vw !important;
+          max-width: 92vw !important;
         }
         .dsh-ssh-modal-body {
-          padding: 16px 16px;
+          padding: 16px 14px !important;
         }
         .dsh-ssh-modal-header {
-          padding: 12px 16px !important;
+          padding: 12px 14px !important;
         }
       }
       .dsh-ssh-modal-header {
@@ -990,14 +997,21 @@ function initSidebarButton() {
         border-color: var(--dsw-alias-state-business-primary) !important;
       }
       .dsh-ssh-select {
+        width: 100%;
         min-width: 0;
         max-width: 100%;
         box-sizing: border-box;
         height: 34px;
-        padding: 0 10px;
+        padding: 0 28px 0 10px;
         border-radius: 8px;
         border: 1px solid var(--dsw-alias-border-l2) !important;
-        background: var(--dsw-alias-bg-module-platform) !important;
+        background-color: var(--dsw-alias-bg-module-platform) !important;
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23888888' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+        background-repeat: no-repeat;
+        background-position: right 10px center;
+        -webkit-appearance: none;
+        -moz-appearance: none;
+        appearance: none;
         color: var(--dsw-alias-label-primary) !important;
         font-size: 13px;
         outline: none;
@@ -1008,6 +1022,9 @@ function initSidebarButton() {
       }
       .dsh-ssh-select:focus {
         border-color: var(--dsw-alias-state-business-primary) !important;
+      }
+      .dsh-ssh-select::-ms-expand {
+        display: none;
       }
       .dsh-ssh-btn-secondary {
         height: 34px;
@@ -1075,8 +1092,8 @@ function initSidebarButton() {
     modalHost = document.createElement('div')
     modalHost.id = 'dsh-ssh-modal-host'
     document.body.appendChild(modalHost)
-    ReactDOM.render(<GlobalModalHost />, modalHost)
   }
+  ReactDOM.render(<GlobalModalHost />, modalHost)
 
   // Inject Button into Workspace headerActions next to the native add button
   const tryInjectButton = () => {
