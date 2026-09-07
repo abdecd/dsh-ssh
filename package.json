@@ -35,6 +35,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
+    "test": "node --test tests/unit.test.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

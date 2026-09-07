@@ -4,6 +4,7 @@ export interface SshRunResult {
     stdout: string;
     stderr: string;
     error?: string;
+    stdoutTruncated?: boolean;
 }
 export interface SshRunOptions {
     /** Use this password for this invocation without reading or mutating the cache. */
@@ -68,8 +69,9 @@ export declare function remoteListDir(host: string, remotePath: string, localDis
  */
 export declare function remoteReadFile(host: string, remotePath: string): Promise<FsReadResult>;
 /**
- * Atomically write content to a remote file.
- * Writes to a unique temp file and atomically renames via mv to avoid file truncation on abort.
+ * Atomically write content to a remote file while strictly preserving file permissions.
+ * Writes to a unique temp file with restrictive permissions (0600), applies original permissions
+ * or safe defaults, and atomically renames via mv to avoid permission loosening or partial writes.
  */
 export declare function remoteWriteFile(host: string, remotePath: string, content: string | Buffer): Promise<{
     ok: boolean;

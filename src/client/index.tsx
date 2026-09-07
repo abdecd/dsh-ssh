@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import ReactDOM from 'react-dom'
 
 interface SshHost {
@@ -30,15 +30,20 @@ export function RemoteFolderBrowserModal({
   initialPath?: string
   password?: string
 }) {
-  const [currentPath, setCurrentPath] = useState(initialPath || '~')
-  const [inputPath, setInputPath] = useState(initialPath || '~')
+  const initial = initialPath?.trim() || '~'
+  const [currentPath, setCurrentPath] = useState(initial)
+  const [inputPath, setInputPath] = useState(initial)
   const [folders, setFolders] = useState<string[]>([])
   const [loading, setLoading] = useState(false)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const [truncated, setTruncated] = useState(false)
+  const reqSeq = useRef(0)
 
   const loadDirectory = async (targetPath: string) => {
     if (!host) return
+    const reqId = ++reqSeq.current
+    setCurrentPath(targetPath)
+    setInputPath(targetPath)
     setLoading(true)
     setErrorMsg(null)
     try {
@@ -52,6 +57,8 @@ export function RemoteFolderBrowserModal({
         })
       }).then((r) => r.json())
 
+      if (reqId !== reqSeq.current) return
+
       if (res.ok) {
         const canonical = res.currentPath || targetPath
         setCurrentPath(canonical)
@@ -62,18 +69,25 @@ export function RemoteFolderBrowserModal({
         setErrorMsg(res.error || '读取目录失败')
       }
     } catch (err: any) {
-      setErrorMsg(err?.message || '网络请求错误')
+      if (reqId === reqSeq.current) {
+        setErrorMsg(err?.message || '网络请求错误')
+      }
     } finally {
-      setLoading(false)
+      if (reqId === reqSeq.current) {
+        setLoading(false)
+      }
     }
   }
 
   useEffect(() => {
     if (isOpen && host) {
       const start = initialPath?.trim() || '~'
+      setCurrentPath(start)
+      setInputPath(start)
+      setFolders([])
       loadDirectory(start)
     }
-  }, [isOpen, host])
+  }, [isOpen, host, initialPath])
 
   if (!isOpen) return null
 
@@ -81,19 +95,32 @@ export function RemoteFolderBrowserModal({
     if (currentPath === '/' || !currentPath) return
     const parts = currentPath.split('/').filter(Boolean)
     parts.pop()
-    const parent = '/' + parts.join('/')
-    loadDirectory(parent)
+    const parent = '/' + (parts.join('/') || '')
+    const resolvedParent = parent === '//' ? '/' : parent
+    setCurrentPath(resolvedParent)
+    setInputPath(resolvedParent)
+    loadDirectory(resolvedParent)
   }
 
   const handleEnterFolder = (name: string) => {
     const next = currentPath === '/' ? `/${name}` : `${currentPath.replace(/\/+$/, '')}/${name}`
+    setCurrentPath(next)
+    setInputPath(next)
     loadDirectory(next)
+  }
+
+  const handleFolderDoubleClick = (name: string) => {
+    const next = currentPath === '/' ? `/${name}` : `${currentPath.replace(/\/+$/, '')}/${name}`
+    onSelect(next)
+    onClose()
   }
 
   const handleInputSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     if (inputPath.trim()) {
-      loadDirectory(inputPath.trim())
+      const target = inputPath.trim()
+      setCurrentPath(target)
+      loadDirectory(target)
     }
   }
 
@@ -203,7 +230,8 @@ export function RemoteFolderBrowserModal({
                   key={name}
                   className="dsh-ssh-folder-item"
                   onClick={() => handleEnterFolder(name)}
-                  title={`点击进入: ${name}`}
+                  onDoubleClick={() => handleFolderDoubleClick(name)}
+                  title={`点击进入并更新路径，双击直接选择: ${name}`}
                 >
                   <div style={{ display: 'flex', alignItems: 'center', gap: '8px', overflow: 'hidden' }}>
                     <span style={{ fontSize: '14px', flexShrink: 0 }}>📁</span>
@@ -286,11 +314,6 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
 
   const handleFolderSelect = (selectedPath: string) => {
     setRemotePath(selectedPath)
-    if (!title.trim()) {
-      const segs = selectedPath.split('/').filter(Boolean)
-      const last = segs.pop() || selectedPath
-      setTitle(last)
-    }
   }
 
   useEffect(() => {
@@ -575,14 +598,16 @@ export function AddRemoteModal({ isOpen, onClose }: { isOpen: boolean; onClose: 
         </form>
       </div>
     </div>
-    <RemoteFolderBrowserModal
-      isOpen={isBrowserOpen}
-      onClose={() => setIsBrowserOpen(false)}
-      onSelect={handleFolderSelect}
-      host={selectedHost}
-      initialPath={remotePath.trim() || '~'}
-      password={isPasswordAuth ? password : undefined}
-    />
+    {isBrowserOpen && (
+      <RemoteFolderBrowserModal
+        isOpen={isBrowserOpen}
+        onClose={() => setIsBrowserOpen(false)}
+        onSelect={handleFolderSelect}
+        host={selectedHost}
+        initialPath={remotePath.trim() || '~'}
+        password={isPasswordAuth ? password : undefined}
+      />
+    )}
   </>,
   document.body
 )

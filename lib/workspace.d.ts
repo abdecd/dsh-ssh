@@ -8,7 +8,10 @@ export interface RemoteWorkspaceMeta {
 export declare function getBaseDir(): string;
 export declare function getWorkspacesDir(): string;
 /**
- * Scan upwards from path to find .remote-ssh.json
+ * Scan and resolve remote workspace metadata for a given path.
+ * Strict security boundary:
+ * Only workspaces managed by dsh-ssh in ~/.dsh/dsh-ssh/workspaces/<id> are recognized.
+ * Unmanaged / arbitrary user project directories containing .remote-ssh.json are strictly ignored.
  */
 export declare function findRemoteWorkspaceMeta(startPath?: string): {
     meta: RemoteWorkspaceMeta;

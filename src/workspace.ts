@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, chmodSync, realpathSync } from 'node:fs'
 import { join, dirname, basename, resolve, sep, posix } from 'node:path'
 import { homedir } from 'node:os'
+import { isValidSshHost } from './config'
 import { closeSshConnection } from './connection'
 
 export interface RemoteWorkspaceMeta {
@@ -28,26 +29,45 @@ export function getWorkspacesDir(): string {
 }
 
 /**
- * Scan upwards from path to find .remote-ssh.json
+ * Scan and resolve remote workspace metadata for a given path.
+ * Strict security boundary:
+ * Only workspaces managed by dsh-ssh in ~/.dsh/dsh-ssh/workspaces/<id> are recognized.
+ * Unmanaged / arbitrary user project directories containing .remote-ssh.json are strictly ignored.
  */
 export function findRemoteWorkspaceMeta(startPath?: string): { meta: RemoteWorkspaceMeta; anchorDir: string } | null {
   if (!startPath) return null
-  let current = resolve(startPath)
 
-  while (current) {
-    const metaPath = join(current, '.remote-ssh.json')
-    if (existsSync(metaPath)) {
-      try {
-        const meta = JSON.parse(readFileSync(metaPath, 'utf8')) as RemoteWorkspaceMeta
-        if (meta && meta.host && meta.remotePath) {
-          return { meta, anchorDir: current }
-        }
-      } catch { }
+  try {
+    const wsBaseDir = resolve(getWorkspacesDir())
+    const prefixWithSep = wsBaseDir.endsWith(sep) ? wsBaseDir : wsBaseDir + sep
+
+    const target = resolve(startPath)
+    let canon = target
+    try { canon = realpathSync(target) } catch { }
+
+    // Path must strictly reside within getWorkspacesDir() and cannot be the base directory itself
+    if (!canon.startsWith(prefixWithSep) || canon === wsBaseDir) {
+      return null
     }
-    const parent = dirname(current)
-    if (parent === current) break
-    current = parent
-  }
+
+    const rel = posix.normalize(canon.slice(prefixWithSep.length).replace(/\\/g, '/'))
+    const anchorName = rel.split('/')[0]
+    if (!anchorName || anchorName === '.' || anchorName === '..') {
+      return null
+    }
+
+    const anchorDir = join(wsBaseDir, anchorName)
+    const metaPath = join(anchorDir, '.remote-ssh.json')
+    if (!existsSync(metaPath)) {
+      return null
+    }
+
+    const meta = JSON.parse(readFileSync(metaPath, 'utf8')) as RemoteWorkspaceMeta
+    if (meta && meta.host && meta.remotePath && isValidSshHost(meta.host)) {
+      return { meta, anchorDir }
+    }
+  } catch { }
+
   return null
 }
 
@@ -264,6 +284,7 @@ export function ensureShellWrapper(): void {
   const runnerJs = `// dsh-ssh terminal wrapper
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { spawn } = require('child_process');
 
 function shellQuote(str) {
@@ -271,25 +292,56 @@ function shellQuote(str) {
   return "'" + String(str).replace(/'/g, "'\\\\''") + "'";
 }
 
-let cur = process.cwd();
-let meta = null;
-const root = path.dirname(cur);
-
-while (cur && cur !== root) {
-  const p = path.join(cur, '.remote-ssh.json');
-  if (fs.existsSync(p)) {
-    try { meta = JSON.parse(fs.readFileSync(p, 'utf8')); } catch {}
-    break;
+function parseSshConfigHosts() {
+  const configPath = path.join(os.homedir(), '.ssh', 'config');
+  if (!fs.existsSync(configPath)) return new Set();
+  try {
+    const content = fs.readFileSync(configPath, 'utf8');
+    const lines = content.split(/\\r?\\n/);
+    const hosts = new Set();
+    for (const rawLine of lines) {
+      const hashIdx = rawLine.indexOf('#');
+      const line = (hashIdx >= 0 ? rawLine.slice(0, hashIdx) : rawLine).trim();
+      if (!line) continue;
+      const parts = line.split(/\\s+/);
+      const key = parts[0] ? parts[0].toLowerCase() : '';
+      if (key === 'host') {
+        const aliases = parts.slice(1).filter((a) => a && !a.includes('*') && !a.includes('?') && !a.startsWith('-'));
+        for (const a of aliases) hosts.add(a.toLowerCase());
+      }
+    }
+    return hosts;
+  } catch {
+    return new Set();
   }
-  const parent = path.dirname(cur);
-  if (parent === cur) break;
-  cur = parent;
 }
+
+let meta = null;
+try {
+  const cur = process.cwd();
+  const wsDir = path.resolve(path.join(os.homedir(), '.dsh', 'dsh-ssh', 'workspaces'));
+  let canon = path.resolve(cur);
+  try { canon = fs.realpathSync(canon); } catch {}
+
+  const prefixWithSep = wsDir.endsWith(path.sep) ? wsDir : wsDir + path.sep;
+  if (canon.startsWith(prefixWithSep) && canon !== wsDir) {
+    const rel = path.relative(wsDir, canon);
+    const anchorName = rel.split(path.sep)[0];
+    if (anchorName && anchorName !== '.' && anchorName !== '..') {
+      const anchorDir = path.join(wsDir, anchorName);
+      const metaPath = path.join(anchorDir, '.remote-ssh.json');
+      if (fs.existsSync(metaPath)) {
+        meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      }
+    }
+  }
+} catch {}
 
 if (meta && meta.host && typeof meta.host === 'string') {
   const host = meta.host.trim();
-  if (!/^[a-zA-Z0-9_.-]+$/.test(host) || host.startsWith('-')) {
-    console.error('[dsh-ssh] 非法或不安全的 SSH 主机名: ' + host);
+  const validHosts = parseSshConfigHosts();
+  if (!/^[a-zA-Z0-9_.-]+$/.test(host) || host.startsWith('-') || !validHosts.has(host.toLowerCase())) {
+    console.error('[dsh-ssh] 非法或未在 ~/.ssh/config 中配置的 SSH 主机: ' + host);
     process.exit(1);
   }
   const remotePath = meta.remotePath;
@@ -297,7 +349,7 @@ if (meta && meta.host && typeof meta.host === 'string') {
   if (remotePath) {
     remoteCmd = 'cd ' + shellQuote(remotePath) + ' 2>/dev/null; exec \${SHELL:-/bin/bash} -l';
   }
-  const socketPath = path.join(require('os').homedir(), '.dsh', 'dsh-ssh', 'sockets', '%r@%h:%p');
+  const socketPath = path.join(os.homedir(), '.dsh', 'dsh-ssh', 'sockets', '%r@%h:%p');
   const args = ['-o', 'ControlMaster=auto', '-o', 'ControlPath=' + socketPath, '-tt', '--', host];
   if (remoteCmd) args.push(remoteCmd);
 

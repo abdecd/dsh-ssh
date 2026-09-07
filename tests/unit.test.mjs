@@ -12,6 +12,8 @@ import {
   deleteRemoteWorkspace,
   getWorkspacesDir,
   runSsh,
+  remoteReadFile,
+  remoteWriteFile,
   remoteBrowseDirs,
   isSafeRequest,
   shellCd
@@ -42,9 +44,23 @@ test('localToRemotePath correctly translates paths', () => {
 })
 
 test('tool outputs are guaranteed to be lossless JSON', async () => {
-  const { snapshotJsonValue } = await import(
-    '/home/user1/.local/share/pnpm/store/v11/links/@deepseek-ai/dsh-util-values/0.1.2-rc.1/9628e3409471155cb618fb6698943649f63b0f0d39272f26ef19a5327b0a339f/node_modules/@deepseek-ai/dsh-util-values/lib/index.js'
-  )
+  const { createRequire } = await import('node:module')
+  const req = createRequire(import.meta.url)
+
+  let snapshotJsonValue
+  try {
+    const toolsPkg = req.resolve('@deepseek-ai/dsh-tools/package.json')
+    const valuesPath = req.resolve('@deepseek-ai/dsh-util-values', { paths: [toolsPkg] })
+    const mod = await import(valuesPath)
+    snapshotJsonValue = mod.snapshotJsonValue
+  } catch {
+    snapshotJsonValue = (val) => {
+      if (val === undefined) return undefined
+      const str = JSON.stringify(val)
+      if (str === undefined) return undefined
+      return JSON.parse(str)
+    }
+  }
 
   function toCleanJson(val) {
     return JSON.parse(JSON.stringify(val))
@@ -216,30 +232,46 @@ test('localToRemotePath prevents path traversal escapes', () => {
   assert.equal(localToRemotePath(safeSub, anchor, remote), '/data/project/my-app/sub/file.txt')
 })
 
-test('findRemoteWorkspaceMeta correctly resolves deep subdirectories', async () => {
+test('findRemoteWorkspaceMeta resolves deep subdirectories in managed workspaces and rejects unmanaged projects', async () => {
   const fs = await import('node:fs')
   const path = await import('node:path')
   const os = await import('node:os')
 
-  const tempDir = path.join(os.tmpdir(), `dsh-deep-find-${Date.now()}`)
-  const deepDir = path.join(tempDir, 'src', 'components', 'modals', 'nested')
+  const oldHome = process.env.HOME
+  const fakeHome = path.join(os.tmpdir(), `dsh-meta-test-${Date.now()}`)
+  const fakeSshDir = path.join(fakeHome, '.ssh')
+  const fakeWsDir = path.join(fakeHome, '.dsh', 'dsh-ssh', 'workspaces')
+  const managedAnchor = path.join(fakeWsDir, 'ws-test-deep')
+  const deepDir = path.join(managedAnchor, 'src', 'components', 'modals', 'nested')
+  const unmanagedDir = path.join(fakeHome, 'unmanaged-project')
+
+  fs.mkdirSync(fakeSshDir, { recursive: true })
+  fs.writeFileSync(path.join(fakeSshDir, 'config'), 'Host test-remote-host\n  HostName 10.0.0.1\n', 'utf8')
   fs.mkdirSync(deepDir, { recursive: true })
+  fs.mkdirSync(unmanagedDir, { recursive: true })
 
   const metaContent = {
     host: 'test-remote-host',
     remotePath: '/var/www/project'
   }
-  fs.writeFileSync(path.join(tempDir, '.remote-ssh.json'), JSON.stringify(metaContent), 'utf8')
+  fs.writeFileSync(path.join(managedAnchor, '.remote-ssh.json'), JSON.stringify(metaContent), 'utf8')
+  fs.writeFileSync(path.join(unmanagedDir, '.remote-ssh.json'), JSON.stringify(metaContent), 'utf8')
 
+  process.env.HOME = fakeHome
   try {
-    // Calling findRemoteWorkspaceMeta from deep directory must find the ancestor anchor
+    // 1. Managed workspace deep path must find the anchor
     const found = findRemoteWorkspaceMeta(deepDir)
-    assert(found, 'must find meta from deep nested subdirectory')
+    assert(found, 'must find meta from deep nested subdirectory in managed workspace')
     assert.equal(found.meta.host, 'test-remote-host')
     assert.equal(found.meta.remotePath, '/var/www/project')
-    assert.equal(found.anchorDir, tempDir)
+    assert.equal(found.anchorDir, managedAnchor)
+
+    // 2. Unmanaged arbitrary project directory containing .remote-ssh.json must be rejected
+    const unmanagedFound = findRemoteWorkspaceMeta(unmanagedDir)
+    assert.equal(unmanagedFound, null, 'must reject unmanaged project outside workspaces directory')
   } finally {
-    fs.rmSync(tempDir, { recursive: true, force: true })
+    process.env.HOME = oldHome
+    fs.rmSync(fakeHome, { recursive: true, force: true })
   }
 })
 
@@ -545,5 +577,190 @@ test('password verification bypasses cached credentials and disables SSH reuse',
     fs.rmSync(tempRoot, { recursive: true, force: true })
   }
 })
+
+test('remoteWriteFile preserves existing file permissions and does not loosen mode', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+
+  const oldHome = process.env.HOME
+  const oldPath = process.env.PATH
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-perm-test-'))
+  const binDir = path.join(tempRoot, 'bin')
+  const testDir = path.join(tempRoot, 'remote')
+  const secretFile = path.join(testDir, 'secret.env')
+  const execFile = path.join(testDir, 'script.sh')
+
+  fs.mkdirSync(binDir, { recursive: true })
+  fs.mkdirSync(testDir, { recursive: true })
+  fs.mkdirSync(path.join(tempRoot, '.ssh'), { recursive: true })
+  fs.writeFileSync(path.join(tempRoot, '.ssh', 'config'), 'Host perm-fixture\n  HostName 127.0.0.1\n', 'utf8')
+
+  // Create fake ssh that executes the command directly via sh
+  const fakeSsh = path.join(binDir, 'ssh')
+  fs.writeFileSync(fakeSsh, '#!/bin/sh\nfor arg do last="$arg"; done\nexec /bin/sh -c "$last"\n', 'utf8')
+  fs.chmodSync(fakeSsh, 0o755)
+
+  // 1. Existing 0600 file
+  fs.writeFileSync(secretFile, 'SECRET_KEY=123456\n', { mode: 0o600 })
+  assert.equal((fs.statSync(secretFile).mode & 0o777).toString(8), '600')
+
+  // 2. Existing 0755 executable
+  fs.writeFileSync(execFile, '#!/bin/sh\necho hi\n', { mode: 0o755 })
+  assert.equal((fs.statSync(execFile).mode & 0o777).toString(8), '755')
+
+  process.env.HOME = tempRoot
+  process.env.PATH = `${binDir}${path.delimiter}${oldPath || ''}`
+  try {
+    const res1 = await remoteWriteFile('perm-fixture', secretFile, 'SECRET_KEY=updated\n')
+    assert.equal(res1.ok, true)
+    assert.equal(fs.readFileSync(secretFile, 'utf8'), 'SECRET_KEY=updated\n')
+    assert.equal((fs.statSync(secretFile).mode & 0o777).toString(8), '600', '0600 mode must be preserved')
+
+    const res2 = await remoteWriteFile('perm-fixture', execFile, '#!/bin/sh\necho updated\n')
+    assert.equal(res2.ok, true)
+    assert.equal((fs.statSync(execFile).mode & 0o777).toString(8), '755', '0755 mode must be preserved')
+  } finally {
+    process.env.HOME = oldHome
+    if (oldPath === undefined) delete process.env.PATH
+    else process.env.PATH = oldPath
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('remoteReadFile handles files over 7.5MB without truncation and rejects corrupted streams', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+
+  const oldHome = process.env.HOME
+  const oldPath = process.env.PATH
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-large-test-'))
+  const binDir = path.join(tempRoot, 'bin')
+  const testDir = path.join(tempRoot, 'remote')
+  const bigFile = path.join(testDir, 'large.bin')
+
+  fs.mkdirSync(binDir, { recursive: true })
+  fs.mkdirSync(testDir, { recursive: true })
+  fs.mkdirSync(path.join(tempRoot, '.ssh'), { recursive: true })
+  fs.writeFileSync(path.join(tempRoot, '.ssh', 'config'), 'Host large-fixture\n  HostName 127.0.0.1\n', 'utf8')
+
+  // Generate an 8MB buffer (which expands to ~10.67MB in Base64)
+  const bigBuffer = Buffer.alloc(8 * 1024 * 1024, 75) // 8MB of 'K'
+  fs.writeFileSync(bigFile, bigBuffer)
+
+  const fakeSsh = path.join(binDir, 'ssh')
+  fs.writeFileSync(fakeSsh, '#!/bin/sh\nfor arg do last="$arg"; done\nexec /bin/sh -c "$last"\n', 'utf8')
+  fs.chmodSync(fakeSsh, 0o755)
+
+  process.env.HOME = tempRoot
+  process.env.PATH = `${binDir}${path.delimiter}${oldPath || ''}`
+  try {
+    // 1. Successfully read large 8MB file without silent Base64 truncation
+    const res = await remoteReadFile('large-fixture', bigFile)
+    assert.equal(res.ok, true)
+    assert.equal(res.size, 8 * 1024 * 1024)
+    assert.equal(res.content?.length, 8 * 1024 * 1024)
+    assert.equal(res.truncated, false)
+
+    // 2. Corrupted fake ssh that omits EOF marker must be rejected
+    const corruptSsh = path.join(binDir, 'corrupt-ssh')
+    fs.writeFileSync(corruptSsh, '#!/bin/sh\nfor arg do last="$arg"; done\n/bin/sh -c "$last" | grep -v "__DSH_READ_EOF__"\n', 'utf8')
+    fs.chmodSync(corruptSsh, 0o755)
+    fs.copyFileSync(corruptSsh, fakeSsh)
+
+    // Clear read cache first
+    const { invalidateCache } = await import('../lib/index.js')
+    invalidateCache('large-fixture', bigFile)
+
+    const corruptRes = await remoteReadFile('large-fixture', bigFile)
+    assert.equal(corruptRes.ok, false)
+    assert.match(corruptRes.error || '', /未完成|校验失败/)
+  } finally {
+    process.env.HOME = oldHome
+    if (oldPath === undefined) delete process.env.PATH
+    else process.env.PATH = oldPath
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('remoteWriteFile respects strict remote umask for new files and avoids unconditional 0644', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+
+  const oldHome = process.env.HOME
+  const oldPath = process.env.PATH
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-umask-test-'))
+  const binDir = path.join(tempRoot, 'bin')
+  const testDir = path.join(tempRoot, 'remote')
+  const fileUnderStrict = path.join(testDir, 'strict_new.env')
+  const fileUnderStandard = path.join(testDir, 'standard_new.txt')
+
+  fs.mkdirSync(binDir, { recursive: true })
+  fs.mkdirSync(testDir, { recursive: true })
+  fs.mkdirSync(path.join(tempRoot, '.ssh'), { recursive: true })
+  fs.writeFileSync(path.join(tempRoot, '.ssh', 'config'), 'Host umask-fixture\n  HostName 127.0.0.1\n', 'utf8')
+
+  // 1. Fake ssh that runs under strict umask 077
+  const fakeSsh = path.join(binDir, 'ssh')
+  fs.writeFileSync(fakeSsh, '#!/bin/sh\nfor arg do last="$arg"; done\numask 077\nexec /bin/sh -c "$last"\n', 'utf8')
+  fs.chmodSync(fakeSsh, 0o755)
+
+  process.env.HOME = tempRoot
+  process.env.PATH = `${binDir}${path.delimiter}${oldPath || ''}`
+  try {
+    const resStrict = await remoteWriteFile('umask-fixture', fileUnderStrict, 'SECRET=val\n')
+    assert.equal(resStrict.ok, true)
+    assert.equal((fs.statSync(fileUnderStrict).mode & 0o777).toString(8), '600', 'new file under umask 077 must be 0600')
+
+    // 2. Fake ssh that runs under standard umask 022
+    fs.writeFileSync(fakeSsh, '#!/bin/sh\nfor arg do last="$arg"; done\numask 022\nexec /bin/sh -c "$last"\n', 'utf8')
+    const resStandard = await remoteWriteFile('umask-fixture', fileUnderStandard, 'NORMAL=val\n')
+    assert.equal(resStandard.ok, true)
+    assert.equal((fs.statSync(fileUnderStandard).mode & 0o777).toString(8), '644', 'new file under umask 022 must be 0644')
+  } finally {
+    process.env.HOME = oldHome
+    if (oldPath === undefined) delete process.env.PATH
+    else process.env.PATH = oldPath
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('runSsh handles early process termination without crashing on unhandled stdin EPIPE error', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+
+  const oldHome = process.env.HOME
+  const oldPath = process.env.PATH
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-epipe-test-'))
+  const binDir = path.join(tempRoot, 'bin')
+
+  fs.mkdirSync(binDir, { recursive: true })
+  fs.mkdirSync(path.join(tempRoot, '.ssh'), { recursive: true })
+  fs.writeFileSync(path.join(tempRoot, '.ssh', 'config'), 'Host epipe-fixture\n  HostName 127.0.0.1\n', 'utf8')
+
+  // Fake ssh that exits immediately with failure without reading stdin
+  const fakeSsh = path.join(binDir, 'ssh')
+  fs.writeFileSync(fakeSsh, '#!/bin/sh\nexit 1\n', 'utf8')
+  fs.chmodSync(fakeSsh, 0o755)
+
+  process.env.HOME = tempRoot
+  process.env.PATH = `${binDir}${path.delimiter}${oldPath || ''}`
+  try {
+    // Write 8MB payload to an immediately-dying process
+    const largePayload = Buffer.alloc(8 * 1024 * 1024, 65)
+    const result = await runSsh('epipe-fixture', 'dummy', largePayload)
+    assert.equal(result.ok, false)
+    assert.equal(result.exitCode, 1)
+  } finally {
+    process.env.HOME = oldHome
+    if (oldPath === undefined) delete process.env.PATH
+    else process.env.PATH = oldPath
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
 
 

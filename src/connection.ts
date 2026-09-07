@@ -4,7 +4,8 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { isValidSshHost } from './config'
 
-const MAX_BYTES = 10 * 1024 * 1024 // 10MB
+const MAX_FILE_BYTES = 10 * 1024 * 1024 // 10MB file size limit
+const MAX_STDOUT_BYTES = 16 * 1024 * 1024 // 16MB stream buffer to accommodate Base64 transfer overhead
 const CACHE_TTL_MS = 5000 // 5 seconds LRU cache
 
 export interface SshRunResult {
@@ -13,6 +14,7 @@ export interface SshRunResult {
   stdout: string
   stderr: string
   error?: string
+  stdoutTruncated?: boolean
 }
 
 export interface SshRunOptions {
@@ -230,6 +232,7 @@ export async function runSsh(
   return new Promise((resolve) => {
     let stdoutText = ''
     let stderrText = ''
+    let stdoutTruncated = false
     let resolved = false
 
     const child = spawn(bin, finalArgs, {
@@ -237,28 +240,57 @@ export async function runSsh(
       env
     })
 
+    const finish = (result: SshRunResult) => {
+      if (resolved) return
+      resolved = true
+      clearTimeout(timer)
+      try { child.stdin?.destroy() } catch {}
+      try { child.stdout?.destroy() } catch {}
+      try { child.stderr?.destroy() } catch {}
+      resolve(result)
+    }
+
     const timer = setTimeout(() => {
-      if (!resolved) {
-        resolved = true
-        try { child.kill('SIGKILL') } catch {}
-        resolve({
-          ok: false,
-          exitCode: -1,
-          stdout: stdoutText,
-          stderr: stderrText,
-          error: `SSH 命令执行超时 (${timeoutMs / 1000}s)`
-        })
-      }
+      try { child.kill('SIGKILL') } catch {}
+      finish({
+        ok: false,
+        exitCode: -1,
+        stdout: stdoutText,
+        stderr: stderrText,
+        error: `SSH 命令执行超时 (${timeoutMs / 1000}s)`,
+        stdoutTruncated
+      })
     }, timeoutMs)
 
+    if (child.stdin) {
+      child.stdin.on('error', (_err: any) => {
+        // EPIPE or ECONNRESET on stdin happens when the SSH process terminates early
+        // (e.g. auth failure, immediate command failure, broken pipe).
+        // Catching it prevents Node.js from throwing an unhandled 'error' event and crashing.
+      })
+    }
+
     if (stdinData !== undefined && child.stdin) {
-      child.stdin.write(stdinData)
-      child.stdin.end()
+      try {
+        child.stdin.write(stdinData, () => {
+          try { child.stdin?.end() } catch {}
+        })
+      } catch {
+        // Write failures are caught by stdin.on('error') and child 'close'/'error'
+      }
     }
 
     child.stdout?.on('data', (chunk: Buffer) => {
-      if (stdoutText.length < MAX_BYTES) {
-        stdoutText += chunk.toString('utf8')
+      if (stdoutText.length < MAX_STDOUT_BYTES) {
+        const remain = MAX_STDOUT_BYTES - stdoutText.length
+        if (chunk.length > remain) {
+          stdoutText += chunk.subarray(0, remain).toString('utf8')
+          stdoutTruncated = true
+        } else {
+          stdoutText += chunk.toString('utf8')
+        }
+      } else {
+        stdoutTruncated = true
       }
     })
 
@@ -269,34 +301,28 @@ export async function runSsh(
     })
 
     child.on('error', (err) => {
-      if (!resolved) {
-        resolved = true
-        clearTimeout(timer)
-        resolve({
-          ok: false,
-          exitCode: -1,
-          stdout: stdoutText,
-          stderr: stderrText,
-          error: 'SSH 进程启动失败: ' + err.message
-        })
-      }
+      finish({
+        ok: false,
+        exitCode: -1,
+        stdout: stdoutText,
+        stderr: stderrText,
+        error: 'SSH 进程启动失败: ' + err.message,
+        stdoutTruncated
+      })
     })
 
     child.on('close', (code) => {
-      if (!resolved) {
-        resolved = true
-        clearTimeout(timer)
-        const exitCode = code ?? 0
-        const ok = exitCode === 0
-        const errHint = !ok ? (translateSshError(stderrText) || `SSH 退出码: ${exitCode}`) : undefined
-        resolve({
-          ok,
-          exitCode,
-          stdout: stdoutText,
-          stderr: stderrText,
-          error: errHint
-        })
-      }
+      const exitCode = code ?? 0
+      const ok = exitCode === 0
+      const errHint = !ok ? (translateSshError(stderrText) || `SSH 退出码: ${exitCode}`) : undefined
+      finish({
+        ok,
+        exitCode,
+        stdout: stdoutText,
+        stderr: stderrText,
+        error: errHint,
+        stdoutTruncated
+      })
     })
   })
 }
@@ -464,11 +490,14 @@ export async function remoteReadFile(
     return cached
   }
 
-  // Stat file size first, verify within MAX_BYTES to prevent truncation corruption, then base64 stream
+  // Stat file size first, verify within MAX_FILE_BYTES, then stream Base64 with size and EOF markers
   const script = `( [ -f ${shellQuote(remotePath)} ] || { echo '__DSH_ERR_NOT_FOUND__'; exit 1; }; ` +
     `SIZE=$(wc -c < ${shellQuote(remotePath)} 2>/dev/null || stat -c %s ${shellQuote(remotePath)} 2>/dev/null || echo 0); ` +
-    `if [ "$SIZE" -gt ${MAX_BYTES} ]; then echo "__DSH_ERR_TOO_LARGE__:$SIZE"; exit 1; fi; ` +
-    `base64 < ${shellQuote(remotePath)} 2>/dev/null )`
+    `if [ "$SIZE" -gt ${MAX_FILE_BYTES} ]; then echo "__DSH_ERR_TOO_LARGE__:$SIZE"; exit 1; fi; ` +
+    `echo "__DSH_FILE_SIZE__:$SIZE"; ` +
+    `base64 < ${shellQuote(remotePath)} 2>/dev/null; ` +
+    `echo ""; ` +
+    `echo "__DSH_READ_EOF__"; )`
 
   const r = await runSsh(host, script)
   if (!r.ok) {
@@ -483,12 +512,35 @@ export async function remoteReadFile(
     return { ok: false, error: r.error || r.stderr || '读取文件失败' }
   }
 
-  const rawB64 = r.stdout.replace(/\s+/g, '')
+  // Verify transmission completeness: EOF marker must exist and stdout must not be truncated
+  if (!r.stdout.includes('__DSH_READ_EOF__') || r.stdoutTruncated) {
+    return { ok: false, error: '远程文件读取未完成（数据传输中断或超过缓冲区限制），已拒绝解析以防文件损坏' }
+  }
+
+  const sizeMatch = r.stdout.match(/__DSH_FILE_SIZE__:(\d+)/)
+  if (!sizeMatch) {
+    return { ok: false, error: '未能获取远程文件大小元数据' }
+  }
+  const expectedSize = parseInt(sizeMatch[1], 10)
+
+  // Extract base64 payload strictly between size marker and EOF marker
+  const startIndex = r.stdout.indexOf(sizeMatch[0]) + sizeMatch[0].length
+  const endIndex = r.stdout.indexOf('__DSH_READ_EOF__')
+  const rawB64 = r.stdout.slice(startIndex, endIndex).replace(/\s+/g, '')
+
   let buffer: Buffer
   try {
     buffer = Buffer.from(rawB64, 'base64')
   } catch (e) {
     return { ok: false, error: '解码远程文件失败: ' + String(e) }
+  }
+
+  // Exact byte length integrity check
+  if (buffer.length !== expectedSize) {
+    return {
+      ok: false,
+      error: `远程文件完整性校验失败：预期大小 ${expectedSize} 字节，实际接收 ${buffer.length} 字节。已拒绝返回以防止损坏文件。`
+    }
   }
 
   // Detect binary: check first 8000 bytes for NUL byte
@@ -519,8 +571,9 @@ export async function remoteReadFile(
 }
 
 /**
- * Atomically write content to a remote file.
- * Writes to a unique temp file and atomically renames via mv to avoid file truncation on abort.
+ * Atomically write content to a remote file while strictly preserving file permissions.
+ * Writes to a unique temp file with restrictive permissions (0600), applies original permissions
+ * or safe defaults, and atomically renames via mv to avoid permission loosening or partial writes.
  */
 export async function remoteWriteFile(
   host: string,
@@ -534,8 +587,20 @@ export async function remoteWriteFile(
   const dirname = remotePath.split('/').slice(0, -1).join('/') || '.'
   const tmpPath = `${remotePath}.dsh-tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   const script = `mkdir -p ${shellQuote(dirname)} && ` +
+    `( touch ${shellQuote(tmpPath)} 2>/dev/null && chmod 600 ${shellQuote(tmpPath)} 2>/dev/null && ` +
     `base64 -d > ${shellQuote(tmpPath)} && ` +
-    `mv -f ${shellQuote(tmpPath)} ${shellQuote(remotePath)} || ` +
+    `if [ -e ${shellQuote(remotePath)} ]; then ` +
+    `chmod --reference=${shellQuote(remotePath)} ${shellQuote(tmpPath)} 2>/dev/null || { ` +
+    `MODE=$(stat -c %a ${shellQuote(remotePath)} 2>/dev/null || stat -f %OLp ${shellQuote(remotePath)} 2>/dev/null || stat -f %Lp ${shellQuote(remotePath)} 2>/dev/null); ` +
+    `[ -n "$MODE" ] && chmod "$MODE" ${shellQuote(tmpPath)} 2>/dev/null; }; ` +
+    `else ` +
+    `UM=$(umask 2>/dev/null || echo 077); ` +
+    `CLEAN_UM=$(echo "$UM" | sed 's/^0*//' 2>/dev/null); ` +
+    `[ -z "$CLEAN_UM" ] && CLEAN_UM="0"; ` +
+    `MODE=$(printf '%03o' $(( 0666 & ~0$CLEAN_UM )) 2>/dev/null || echo 600); ` +
+    `chmod "$MODE" ${shellQuote(tmpPath)} 2>/dev/null || chmod 600 ${shellQuote(tmpPath)} 2>/dev/null; ` +
+    `fi && ` +
+    `mv -f ${shellQuote(tmpPath)} ${shellQuote(remotePath)} ) || ` +
     `{ rm -f ${shellQuote(tmpPath)} 2>/dev/null; exit 1; }`
 
   const r = await runSsh(host, script, b64)
