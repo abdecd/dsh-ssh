@@ -5,6 +5,14 @@ export interface SshRunResult {
     stderr: string;
     error?: string;
 }
+export interface SshRunOptions {
+    /** Use this password for this invocation without reading or mutating the cache. */
+    password?: string;
+    /** Do not use or create a ControlMaster connection. */
+    disableConnectionReuse?: boolean;
+    /** Restrict authentication to a direct password exchange. */
+    passwordOnly?: boolean;
+}
 export interface FsEntry {
     name: string;
     path: string;
@@ -45,7 +53,7 @@ export declare function shellCd(targetPath: string): string;
 /**
  * Execute a command on remote host via OpenSSH CLI with ControlMaster socket multiplexing.
  */
-export declare function runSsh(host: string, command: string, stdinData?: string | Buffer, timeoutMs?: number): Promise<SshRunResult>;
+export declare function runSsh(host: string, command: string, stdinData?: string | Buffer, timeoutMs?: number, options?: SshRunOptions): Promise<SshRunResult>;
 export declare function invalidateCache(host?: string, remotePath?: string): void;
 /**
  * List files in a remote directory. Formatted for dsh-better-sidebar.
@@ -81,6 +89,12 @@ export declare function remoteSearchFiles(host: string, remotePath: string, loca
 }>;
 /**
  * Test SSH connection to host.
+ *
+ * A supplied password is deliberately scoped to this one connection attempt:
+ * it is not written to the global cache until the caller has confirmed success.
+ * Password attempts also bypass ControlMaster and all non-password methods so
+ * an existing key or multiplexed session cannot make an incorrect password
+ * appear valid.
  */
 export declare function testSshConnection(host: string, password?: string): Promise<{
     ok: boolean;

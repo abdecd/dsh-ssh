@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, chmodSync, realpathSync } from 'node:fs'
 import { join, dirname, basename, resolve, sep, posix } from 'node:path'
 import { homedir } from 'node:os'
-import { setHostPassword, closeSshConnection } from './connection'
+import { closeSshConnection } from './connection'
 
 export interface RemoteWorkspaceMeta {
   host: string
@@ -97,6 +97,8 @@ export function localToRemotePath(localPath: string, anchorDir: string, remoteRo
 
 /**
  * Create a new remote workspace anchor and register it into DSH workspaceRegistry.
+ * Passwords are retained as a compatibility parameter but are never cached here;
+ * callers must verify them before creating the workspace.
  */
 export async function createRemoteWorkspace(
   workspaceRegistry: any,
@@ -116,9 +118,9 @@ export async function createRemoteWorkspace(
     const title = customTitle || `${folderName} (${host})`
 
     const isPassword = authType === 'password'
-    if (isPassword && password) {
-      setHostPassword(host, password)
-    }
+    // Keep the legacy parameter for compatibility, but never cache an
+    // unverified password from this workspace-construction helper.
+    void password
 
     const meta: RemoteWorkspaceMeta = {
       host,
@@ -214,8 +216,9 @@ export function hookWorkspaceRegistryDeletion(ctx: any): void {
 
   reg.__dshSshHooked = true
   const originalDelete = reg.delete.bind(reg)
-  const wsBaseDir = resolve(getWorkspacesDir()).toLowerCase()
-  const sep = (process.platform === 'win32' ? '\\' : '/').toLowerCase()
+  // Compare paths using their native spelling. Lowercasing would make a
+  // case-sensitive path outside this directory look like an allowed anchor.
+  const wsBaseDir = resolve(getWorkspacesDir())
   const prefixWithSep = wsBaseDir.endsWith(sep) ? wsBaseDir : wsBaseDir + sep
 
   reg.delete = async function (id: any) {
@@ -225,8 +228,8 @@ export function hookWorkspaceRegistryDeletion(ctx: any): void {
       if (entity && entity.path) {
         const p = String(entity.path)
         const resolvedPath = resolve(p)
-        let canon = resolvedPath.toLowerCase()
-        try { canon = realpathSync(resolvedPath).toLowerCase() } catch { }
+        let canon = resolvedPath
+        try { canon = realpathSync(resolvedPath) } catch { }
         if (canon.startsWith(prefixWithSep) && canon !== wsBaseDir) {
           anchorToRemove = resolvedPath
         }

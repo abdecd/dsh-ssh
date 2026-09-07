@@ -22,6 +22,8 @@ export declare function findRemoteWorkspaceMeta(startPath?: string): {
 export declare function localToRemotePath(localPath: string, anchorDir: string, remoteRoot: string): string;
 /**
  * Create a new remote workspace anchor and register it into DSH workspaceRegistry.
+ * Passwords are retained as a compatibility parameter but are never cached here;
+ * callers must verify them before creating the workspace.
  */
 export declare function createRemoteWorkspace(workspaceRegistry: any, host: string, remotePath: string, customTitle?: string, authType?: 'key' | 'password', password?: string): Promise<{
     ok: boolean;

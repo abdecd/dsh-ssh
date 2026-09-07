@@ -44,9 +44,10 @@ function resolveSessionCwd(ctx: any, exec: any): string | undefined {
  * Infer active host and remote root from execution context if user didn't specify.
  * Hardened with host validation and remote path traversal check.
  */
-function resolveContext(ctx: any, args: { host?: string; path?: string }, exec: any) {
+function resolveContext(ctx: any, args: { host?: string; path?: string; cwd?: string }, exec: any) {
   const sessionCwd = resolveSessionCwd(ctx, exec)
   const remoteInfo = findRemoteWorkspaceMeta(sessionCwd)
+  const requestedPath = args.path !== undefined ? args.path : args.cwd
 
   // Host isolation: If inside a remote workspace, prevent executing against another host
   if (remoteInfo && args.host && args.host.toLowerCase() !== remoteInfo.meta.host.toLowerCase()) {
@@ -65,7 +66,7 @@ function resolveContext(ctx: any, args: { host?: string; path?: string }, exec: 
     return { host: null, remoteRoot, resolvedPath: null, error: `主机校验失败：主机 "${host}" 非法或不在 ~/.ssh/config 列表中` }
   }
 
-  let resolvedPath = args.path
+  let resolvedPath = requestedPath
   if (resolvedPath !== undefined && resolvedPath !== '') {
     if (!resolvedPath.startsWith('/') && !resolvedPath.startsWith('~')) {
       resolvedPath = `${remoteRoot.replace(/\/+$/, '')}/${resolvedPath}`
@@ -78,18 +79,18 @@ function resolveContext(ctx: any, args: { host?: string; path?: string }, exec: 
     // Block any path escaping via ..
     const normCheck = posix.normalize(resolvedPath.replace(/\\/g, '/'))
     if (normCheck.startsWith('../') || normCheck === '..') {
-      return { host, remoteRoot, resolvedPath: null, error: `路径遍历拦截：禁止使用 ".." 访问越权路径: "${args.path}"` }
+      return { host, remoteRoot, resolvedPath: null, error: `路径遍历拦截：禁止使用 ".." 访问越权路径: "${requestedPath}"` }
     }
 
     if (remoteInfo) {
       if (resolvedPath.startsWith('~') && !remoteRoot.startsWith('~')) {
-        return { host, remoteRoot, resolvedPath: null, error: `路径拦截：当前工作区目录限制在 "${remoteRoot}"，禁止跨越到用户家目录: "${args.path}"` }
+        return { host, remoteRoot, resolvedPath: null, error: `路径拦截：当前工作区目录限制在 "${remoteRoot}"，禁止跨越到用户家目录: "${requestedPath}"` }
       }
       const cleanBase = posix.normalize(remoteRoot.replace(/\\/g, '/'))
       const normTarget = posix.normalize(resolvedPath.replace(/\\/g, '/'))
       const baseWithSlash = cleanBase.endsWith('/') ? cleanBase : cleanBase + '/'
       if (cleanBase !== '/' && !normTarget.startsWith(baseWithSlash) && normTarget !== cleanBase) {
-        return { host, remoteRoot, resolvedPath: null, error: `路径遍历拦截：禁止访问超出远程工作区目录的路径: "${resolvedPath}"` }
+        return { host, remoteRoot, resolvedPath: null, error: `路径遍历拦截：禁止访问超出远程工作区目录的路径: "${requestedPath}"` }
       }
       resolvedPath = normTarget
     }
@@ -151,7 +152,7 @@ export function registerTools(ctx: any) {
       render: textRender((_, v) => renderExec(v))
     },
     execute: async (args: any, exec: any) => {
-      const { host, remoteRoot, error: ctxErr } = resolveContext(ctx, args, exec)
+      const { host, remoteRoot, resolvedPath, error: ctxErr } = resolveContext(ctx, args, exec)
       if (ctxErr) {
         return toCleanJson({
           ok: false,
@@ -174,10 +175,10 @@ export function registerTools(ctx: any) {
       const authErr = checkToolAuth(ctx, host, exec)
       if (authErr) return toCleanJson(authErr)
 
-      const execDir = args.cwd || remoteRoot
+      const execDir = args.cwd ? resolvedPath : remoteRoot
       let cmd = String(args.command || '').trim()
       if (execDir) {
-        cmd = `${shellCd(execDir)}; ${cmd}`
+        cmd = `${shellCd(execDir)} && ${cmd}`
       }
 
       const r = await runSsh(host, cmd)

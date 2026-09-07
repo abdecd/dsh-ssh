@@ -243,25 +243,57 @@ test('findRemoteWorkspaceMeta correctly resolves deep subdirectories', async () 
   }
 })
 
-test('isSafeRequest blocks cross-origin attacks while allowing local loopback', () => {
-  // Cross-site fetch must be blocked
+test('isSafeRequest strictly validates origin, host, and port', () => {
+  // 1. Cross-site fetch must be blocked
   assert.equal(isSafeRequest({ headers: { 'sec-fetch-site': 'cross-site' } }), false)
 
-  // Disallowed form submission or text simple requests
+  // 2. Disallowed simple request content-types
   assert.equal(isSafeRequest({ headers: { 'content-type': 'application/x-www-form-urlencoded' } }), false)
   assert.equal(isSafeRequest({ headers: { 'content-type': 'multipart/form-data' } }), false)
 
-  // Untrusted external origin
-  assert.equal(isSafeRequest({ headers: { origin: 'http://attacker.com' } }), false)
-  assert.equal(isSafeRequest({ headers: { referer: 'https://evil.org/hack' } }), false)
+  // 3. Untrusted external origin
+  assert.equal(isSafeRequest({ headers: { host: 'localhost:3080', origin: 'http://attacker.com' } }), false)
+  assert.equal(isSafeRequest({ headers: { host: 'localhost:3080', referer: 'https://evil.org/hack' } }), false)
 
-  // Trusted local origins
-  assert.equal(isSafeRequest({ headers: { origin: 'http://localhost:3080' } }), true)
-  assert.equal(isSafeRequest({ headers: { origin: 'http://127.0.0.1:3080' } }), true)
-  assert.equal(isSafeRequest({ headers: { host: 'my-dsh.internal:3080', origin: 'http://my-dsh.internal:3080' } }), true)
+  // 4. Cross-port requests on localhost must be REJECTED (solves same-host cross-port CSRF)
+  assert.equal(
+    isSafeRequest({ headers: { host: 'localhost:3080', origin: 'http://localhost:8080' } }),
+    false,
+    'different port on localhost must be blocked'
+  )
+  assert.equal(
+    isSafeRequest({ headers: { host: '127.0.0.1:3080', origin: 'http://127.0.0.1:9000' } }),
+    false,
+    'different port on 127.0.0.1 must be blocked'
+  )
+  assert.equal(
+    isSafeRequest({ headers: { host: 'my-dsh.internal:3080', origin: 'http://my-dsh.internal:8888' } }),
+    false,
+    'different port on domain must be blocked'
+  )
 
-  // Non-browser local callers (empty origin)
-  assert.equal(isSafeRequest({ headers: {} }), true)
+  // 5. Trusted matching origin and port
+  assert.equal(isSafeRequest({ headers: { host: 'localhost:3080', origin: 'http://localhost:3080' } }), true)
+  assert.equal(isSafeRequest({ headers: { host: '127.0.0.1:3080', origin: 'http://127.0.0.1:3080' } }), true)
+  assert.equal(isSafeRequest({ headers: { host: 'localhost:3080', origin: 'http://127.0.0.1:3080' } }), true)
+  assert.equal(isSafeRequest({ headers: { host: 'my-dsh.internal:443', origin: 'https://my-dsh.internal:443' } }), true)
+  assert.equal(
+    isSafeRequest({
+      headers: { host: 'my-dsh.internal', 'x-forwarded-proto': 'https', origin: 'https://my-dsh.internal' }
+    }),
+    true
+  )
+  assert.equal(isSafeRequest({ headers: { host: 'my-dsh.internal', origin: 'http://my-dsh.internal' } }), true)
+
+  // 6. Browser-like request stripped of Origin/Referer must be blocked
+  assert.equal(isSafeRequest({ headers: { 'sec-fetch-mode': 'cors' } }), false)
+  assert.equal(isSafeRequest({ headers: { 'sec-ch-ua': '"Not;A=Brand";v="24"' } }), false)
+
+  // 7. Non-browser local CLI callers (loopback) allowed
+  assert.equal(isSafeRequest({ headers: {}, socket: { remoteAddress: '127.0.0.1' } }), true)
+
+  // 8. Non-browser external callers without origin must be blocked
+  assert.equal(isSafeRequest({ headers: {}, socket: { remoteAddress: '192.168.1.100' } }), false)
 })
 
 test('shellCd correctly handles ~ home directory expansion', () => {
@@ -392,6 +424,126 @@ test('remoteBrowseDirs blocks dangerous characters and unvalidated hosts', async
   const res4 = await remoteBrowseDirs('non-existent-host-xyz', '/var/www')
   assert.equal(res4.ok, false)
   assert(res4.error?.includes('主机校验失败'))
+})
+
+test('workspace deletion keeps case-sensitive POSIX paths outside the allowlist', async () => {
+  if (process.platform === 'win32') return
+
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+  const { hookWorkspaceRegistryDeletion } = await import('../lib/index.js')
+
+  const oldHome = process.env.HOME
+  const fakeHome = path.join(os.tmpdir(), 'fake-home-case-' + Date.now())
+  const caseVariantAnchor = path.join(fakeHome, '.dsh', 'DSH-SSH', 'workspaces', 'ordinary-project')
+  fs.mkdirSync(caseVariantAnchor, { recursive: true })
+  fs.writeFileSync(path.join(caseVariantAnchor, 'sentinel'), 'must remain')
+
+  process.env.HOME = fakeHome
+  try {
+    const mockRegistry = {
+      delete: async () => true,
+      get: () => ({ path: caseVariantAnchor })
+    }
+
+    hookWorkspaceRegistryDeletion({ workspaceRegistry: mockRegistry })
+    await mockRegistry.delete('ordinary-project')
+    assert(fs.existsSync(path.join(caseVariantAnchor, 'sentinel')), 'case-distinct path must not be treated as an anchor')
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(fakeHome, { recursive: true, force: true })
+  }
+})
+
+test('remote_ssh_exec does not run a command when cwd cannot be entered', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+  const { registerTools } = await import('../lib/index.js')
+
+  const oldHome = process.env.HOME
+  const oldPath = process.env.PATH
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-cwd-test-'))
+  const binDir = path.join(tempRoot, 'bin')
+  const anchorDir = path.join(tempRoot, 'anchor')
+  const marker = path.join(tempRoot, 'executed')
+  fs.mkdirSync(binDir, { recursive: true })
+  fs.mkdirSync(anchorDir, { recursive: true })
+  fs.mkdirSync(path.join(tempRoot, '.ssh'), { recursive: true })
+  fs.writeFileSync(path.join(tempRoot, '.ssh', 'config'), 'Host cwd-fixture\n  HostName 127.0.0.1\n', 'utf8')
+  fs.writeFileSync(path.join(anchorDir, '.remote-ssh.json'), JSON.stringify({
+    host: 'cwd-fixture',
+    remotePath: '/tmp',
+    authType: 'key'
+  }), 'utf8')
+  const fakeSsh = path.join(binDir, 'ssh')
+  fs.writeFileSync(fakeSsh, '#!/bin/sh\nfor arg do last="$arg"; done\n/bin/sh -c "$last"\n', 'utf8')
+  fs.chmodSync(fakeSsh, 0o755)
+
+  process.env.HOME = tempRoot
+  process.env.PATH = `${binDir}${path.delimiter}${oldPath || ''}`
+  try {
+    const tools = new Map()
+    registerTools({ tools: { register: (tool) => tools.set(tool.name, tool) } })
+    const result = await tools.get('remote_ssh_exec').execute({
+      host: 'cwd-fixture',
+      cwd: path.join(tempRoot, 'missing-directory'),
+      command: `printf executed > ${marker}`
+    }, { session: { header: { cwd: anchorDir } } })
+
+    assert.equal(result.ok, false, 'failed cwd must fail the SSH command')
+    assert.equal(fs.existsSync(marker), false, 'command must not run after cwd failure')
+  } finally {
+    process.env.HOME = oldHome
+    if (oldPath === undefined) delete process.env.PATH
+    else process.env.PATH = oldPath
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('password verification bypasses cached credentials and disables SSH reuse', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+  const { getHostPassword, removeHostPassword, setHostPassword, testSshConnection } = await import('../lib/index.js')
+
+  const oldHome = process.env.HOME
+  const oldPath = process.env.PATH
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-password-test-'))
+  const binDir = path.join(tempRoot, 'bin')
+  const argsFile = path.join(tempRoot, 'sshpass-args')
+  fs.mkdirSync(binDir, { recursive: true })
+  fs.mkdirSync(path.join(tempRoot, '.ssh'), { recursive: true })
+  fs.writeFileSync(path.join(tempRoot, '.ssh', 'config'), 'Host password-fixture\n  HostName 127.0.0.1\n', 'utf8')
+  const fakeSshpass = path.join(binDir, 'sshpass')
+  fs.writeFileSync(fakeSshpass, '#!/bin/sh\nprintf "%s\\n" "$@" > "$DSH_TEST_SSHPASS_ARGS"\nprintf "OK\\n"\n', 'utf8')
+  fs.chmodSync(fakeSshpass, 0o755)
+
+  process.env.HOME = tempRoot
+  process.env.PATH = `${binDir}${path.delimiter}${oldPath || ''}`
+  process.env.DSH_TEST_SSHPASS_ARGS = argsFile
+  removeHostPassword('password-fixture')
+  setHostPassword('password-fixture', 'old-password')
+  try {
+    const result = await testSshConnection('password-fixture', 'new-password')
+    assert.equal(result.ok, true)
+    assert.equal(getHostPassword('password-fixture'), 'old-password', 'verification must not replace the cache itself')
+
+    const args = fs.readFileSync(argsFile, 'utf8')
+    assert.match(args, /ControlMaster=no/)
+    assert.match(args, /ControlPath=none/)
+    assert.match(args, /PubkeyAuthentication=no/)
+    assert.match(args, /PreferredAuthentications=password/)
+    assert.match(args, /KbdInteractiveAuthentication=no/)
+  } finally {
+    removeHostPassword('password-fixture')
+    delete process.env.DSH_TEST_SSHPASS_ARGS
+    process.env.HOME = oldHome
+    if (oldPath === undefined) delete process.env.PATH
+    else process.env.PATH = oldPath
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+  }
 })
 
 

@@ -5,33 +5,100 @@ import { isSafeRequest } from './interceptor'
 
 const MAX_BODY_BYTES = 1024 * 1024 // 1MB
 
-// Simple in-memory brute force protection
-const failedAttempts = new Map<string, { count: number; lockedUntil: number }>()
+// Simple in-memory brute force protection. The key is normalized so casing or
+// surrounding whitespace cannot create a second limiter bucket. inFlight
+// reserves concurrent attempts before the SSH connection is started.
+interface FailedAttemptRecord {
+  count: number
+  lockedUntil: number
+  inFlight: number
+}
 
+const failedAttempts = new Map<string, FailedAttemptRecord>()
+
+function rateLimitKey(host: string): string {
+  return host.trim().toLowerCase()
+}
+
+function rateLimitMessage(remainingSeconds: number): string {
+  return `认证失败次数过多，为防止目标主机账户被锁定，请在 ${remainingSeconds} 秒后重试`
+}
+
+/** Reserve one password attempt, or return a lockout message. */
 function checkRateLimit(host: string): string | null {
-  const record = failedAttempts.get(host)
-  if (!record) return null
-  if (record.lockedUntil > Date.now()) {
-    const remaining = Math.ceil((record.lockedUntil - Date.now()) / 1000)
-    return `认证失败次数过多，为防止目标主机账户被锁定，请在 ${remaining} 秒后重试`
+  const key = rateLimitKey(host)
+  const now = Date.now()
+  let record = failedAttempts.get(key)
+
+  if (record && record.lockedUntil > 0 && record.lockedUntil <= now && record.count >= 5 && record.inFlight === 0) {
+    failedAttempts.delete(key)
+    record = undefined
   }
-  if (record.lockedUntil <= Date.now() && record.count >= 5) {
-    failedAttempts.delete(host)
+
+  if (record && record.lockedUntil > now) {
+    return rateLimitMessage(Math.ceil((record.lockedUntil - now) / 1000))
   }
+
+  // Count outstanding attempts as well as completed failures. This prevents a
+  // burst of concurrent requests from bypassing the five-attempt threshold.
+  if (record && record.count + record.inFlight >= 5) {
+    record.lockedUntil = now + 30000
+    failedAttempts.set(key, record)
+    return rateLimitMessage(30)
+  }
+
+  const next = record || { count: 0, lockedUntil: 0, inFlight: 0 }
+  next.inFlight += 1
+  failedAttempts.set(key, next)
   return null
 }
 
 function recordAttemptResult(host: string, success: boolean) {
+  const key = rateLimitKey(host)
+  const current = failedAttempts.get(key) || { count: 0, lockedUntil: 0, inFlight: 0 }
+  current.inFlight = Math.max(0, current.inFlight - 1)
+
   if (success) {
-    failedAttempts.delete(host)
-    return
+    current.count = 0
+    current.lockedUntil = 0
+  } else {
+    current.count += 1
+    if (current.count >= 5) {
+      current.lockedUntil = Date.now() + 30000 // 30s lockout
+    }
   }
-  const current = failedAttempts.get(host) || { count: 0, lockedUntil: 0 }
-  current.count += 1
-  if (current.count >= 5) {
-    current.lockedUntil = Date.now() + 30000 // 30s lockout
+
+  if (current.count === 0 && current.inFlight === 0) {
+    failedAttempts.delete(key)
+  } else {
+    failedAttempts.set(key, current)
   }
-  failedAttempts.set(host, current)
+}
+
+interface PasswordVerificationResult {
+  ok: boolean
+  message: string
+  rateLimited?: boolean
+}
+
+/** Verify a supplied password without caching it until verification succeeds. */
+async function verifyAndCachePassword(host: string, password: string): Promise<PasswordVerificationResult> {
+  const rateErr = checkRateLimit(host)
+  if (rateErr) {
+    return { ok: false, message: rateErr, rateLimited: true }
+  }
+
+  try {
+    const result = await testSshConnection(host, password)
+    recordAttemptResult(host, result.ok)
+    if (result.ok) {
+      setHostPassword(host, password)
+    }
+    return result
+  } catch (err: any) {
+    recordAttemptResult(host, false)
+    return { ok: false, message: err?.message || String(err) || '密码验证失败' }
+  }
 }
 
 async function readJson(req: any): Promise<any> {
@@ -89,26 +156,22 @@ export function registerApiRoutes(ctx: any) {
           }
 
           const body = await readJson(req)
+          const host = typeof body.host === 'string' ? body.host.trim() : body.host
 
-          if (body.host && !isValidSshHost(body.host)) {
+          if (host && !isValidSshHost(host)) {
             sendJson(res, 400, { ok: false, error: `非法或不在 ~/.ssh/config 列表中的主机名: "${body.host}"` })
             return
           }
 
           if (method === 'auth-submit') {
-            if (!body.host || !body.password) {
+            if (!host || typeof body.password !== 'string' || !body.password) {
               sendJson(res, 400, { ok: false, error: 'host and password are required' })
               return
             }
-            const rateErr = checkRateLimit(body.host)
-            if (rateErr) {
-              sendJson(res, 429, { ok: false, error: rateErr })
-              return
-            }
-            const r = await testSshConnection(body.host, body.password)
-            recordAttemptResult(body.host, r.ok)
-            if (r.ok) {
-              setHostPassword(body.host, body.password)
+            const r = await verifyAndCachePassword(host, body.password)
+            if (r.rateLimited) {
+              sendJson(res, 429, { ok: false, error: r.message })
+            } else if (r.ok) {
               sendJson(res, 200, { ok: true, message: '认证成功' })
             } else {
               sendJson(res, 400, { ok: false, error: r.message || '密码验证失败' })
@@ -117,46 +180,82 @@ export function registerApiRoutes(ctx: any) {
           }
 
           if (method === 'test') {
-            if (!body.host) {
+            if (!host) {
               sendJson(res, 400, { ok: false, error: 'host is required' })
               return
             }
-            const rateErr = checkRateLimit(body.host)
-            if (rateErr) {
-              sendJson(res, 429, { ok: false, error: rateErr })
-              return
+
+            if (body.password !== undefined) {
+              if (typeof body.password !== 'string' || !body.password) {
+                sendJson(res, 400, { ok: false, error: 'password must be a non-empty string' })
+                return
+              }
+              const r = await verifyAndCachePassword(host, body.password)
+              if (r.rateLimited) {
+                sendJson(res, 429, { ok: false, error: r.message })
+              } else {
+                sendJson(res, 200, { ok: r.ok, message: r.message })
+              }
+            } else {
+              const r = await testSshConnection(host)
+              sendJson(res, 200, r)
             }
-            const r = await testSshConnection(body.host, body.password)
-            recordAttemptResult(body.host, r.ok)
-            sendJson(res, 200, r)
             return
           }
 
           if (method === 'browse') {
-            if (!body.host) {
+            if (!host) {
               sendJson(res, 400, { ok: false, error: 'host is required' })
               return
             }
-            if (body.password) {
-              setHostPassword(body.host, body.password)
+            if (body.password !== undefined) {
+              if (typeof body.password !== 'string' || !body.password) {
+                sendJson(res, 400, { ok: false, error: 'password must be a non-empty string' })
+                return
+              }
+              const auth = await verifyAndCachePassword(host, body.password)
+              if (auth.rateLimited) {
+                sendJson(res, 429, { ok: false, error: auth.message })
+                return
+              }
+              if (!auth.ok) {
+                sendJson(res, 400, { ok: false, error: auth.message || '密码验证失败' })
+                return
+              }
             }
-            const r = await remoteBrowseDirs(body.host, body.path || '~')
+            const r = await remoteBrowseDirs(host, body.path || '~')
             sendJson(res, r.ok ? 200 : 400, r)
             return
           }
 
           if (method === 'create-workspace') {
-            if (!body.host || !body.remotePath) {
+            if (!host || !body.remotePath) {
               sendJson(res, 400, { ok: false, error: 'host and remotePath are required' })
               return
             }
+
+            if (body.authType === 'password') {
+              if (typeof body.password !== 'string' || !body.password) {
+                sendJson(res, 400, { ok: false, error: 'password must be a non-empty string' })
+                return
+              }
+              const auth = await verifyAndCachePassword(host, body.password)
+              if (auth.rateLimited) {
+                sendJson(res, 429, { ok: false, error: auth.message })
+                return
+              }
+              if (!auth.ok) {
+                sendJson(res, 400, { ok: false, error: auth.message || '密码验证失败' })
+                return
+              }
+            }
+
             const r = await createRemoteWorkspace(
               ctx.workspaceRegistry,
-              body.host,
+              host,
               body.remotePath,
               body.title,
-              body.authType,
-              body.password
+              body.authType
             )
             sendJson(res, r.ok ? 200 : 400, r)
             return

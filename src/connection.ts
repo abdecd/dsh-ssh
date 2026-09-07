@@ -15,6 +15,15 @@ export interface SshRunResult {
   error?: string
 }
 
+export interface SshRunOptions {
+  /** Use this password for this invocation without reading or mutating the cache. */
+  password?: string
+  /** Do not use or create a ControlMaster connection. */
+  disableConnectionReuse?: boolean
+  /** Restrict authentication to a direct password exchange. */
+  passwordOnly?: boolean
+}
+
 export interface FsEntry {
   name: string
   path: string
@@ -151,7 +160,8 @@ export async function runSsh(
   host: string,
   command: string,
   stdinData?: string | Buffer,
-  timeoutMs = 30000
+  timeoutMs = 30000,
+  options: SshRunOptions = {}
 ): Promise<SshRunResult> {
   if (!isValidSshHost(host)) {
     return {
@@ -166,17 +176,40 @@ export async function runSsh(
   const socketDir = getSocketDir()
   const socketPath = join(socketDir, '%r@%h:%p')
 
-  const password = getHostPassword(host)
+  const password = options.password !== undefined
+    ? options.password
+    : getHostPassword(host)
 
   const baseArgs = [
     '-o', 'StrictHostKeyChecking=accept-new',
     '-o', 'ConnectTimeout=10',
     '-o', 'ServerAliveInterval=15',
-    '-o', 'ClearAllForwardings=yes',
-    '-o', 'ControlMaster=auto',
-    '-o', `ControlPath=${socketPath}`,
-    '-o', 'ControlPersist=10m'
+    '-o', 'ClearAllForwardings=yes'
   ]
+
+  if (options.disableConnectionReuse) {
+    // Password verification must not accidentally authenticate through an
+    // already-running ControlMaster connection.
+    baseArgs.push('-o', 'ControlMaster=no', '-o', 'ControlPath=none')
+  } else {
+    baseArgs.push(
+      '-o', 'ControlMaster=auto',
+      '-o', `ControlPath=${socketPath}`,
+      '-o', 'ControlPersist=10m'
+    )
+  }
+
+  if (options.passwordOnly) {
+    // Do not allow a configured key, agent, keyboard-interactive, GSSAPI, or
+    // host-based method to make a wrong password look valid.
+    baseArgs.push(
+      '-o', 'PubkeyAuthentication=no',
+      '-o', 'PreferredAuthentications=password',
+      '-o', 'KbdInteractiveAuthentication=no',
+      '-o', 'GSSAPIAuthentication=no',
+      '-o', 'HostbasedAuthentication=no'
+    )
+  }
 
   if (!password) {
     baseArgs.push('-o', 'BatchMode=yes')
@@ -553,17 +586,30 @@ export async function remoteSearchFiles(
 
 /**
  * Test SSH connection to host.
+ *
+ * A supplied password is deliberately scoped to this one connection attempt:
+ * it is not written to the global cache until the caller has confirmed success.
+ * Password attempts also bypass ControlMaster and all non-password methods so
+ * an existing key or multiplexed session cannot make an incorrect password
+ * appear valid.
  */
 export async function testSshConnection(host: string, password?: string): Promise<{ ok: boolean; message: string }> {
-  if (password) {
-    setHostPassword(host, password)
+  if (password !== undefined && !password) {
+    return { ok: false, message: '密码不能为空' }
   }
-  const r = await runSsh(host, 'echo "OK"', undefined, 8000)
+
+  const hasPassword = password !== undefined
+  const r = await runSsh(
+    host,
+    'echo "OK"',
+    undefined,
+    8000,
+    hasPassword
+      ? { password, disableConnectionReuse: true, passwordOnly: true }
+      : undefined
+  )
   if (r.ok && r.stdout.includes('OK')) {
     return { ok: true, message: '连接成功！' }
-  }
-  if (password && !r.ok) {
-    removeHostPassword(host)
   }
   return { ok: false, message: r.error || r.stderr || '连接失败' }
 }

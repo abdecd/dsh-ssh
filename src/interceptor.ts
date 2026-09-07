@@ -11,8 +11,9 @@ import {
 const MAX_BODY_BYTES = 10 * 1024 * 1024 // 10MB
 
 /**
- * CSRF / Origin validation for HTTP endpoints.
- * Blocks cross-site malicious requests while allowing same-origin and local loopback clients.
+ * CSRF / Origin & Port validation for HTTP endpoints.
+ * Strictly enforces protocol, host, and port matching against Host header.
+ * Eliminates cross-origin and cross-port CSRF risks from localhost or external domains.
  */
 export function isSafeRequest(req: any): boolean {
   const headers = req.headers || {}
@@ -21,27 +22,68 @@ export function isSafeRequest(req: any): boolean {
     return false
   }
 
+  // Reject simple request formats commonly abused in CSRF attacks
   const ct = (headers['content-type'] || '').toLowerCase()
   if (ct.includes('form') || ct.includes('multipart') || (ct.startsWith('text/') && !ct.includes('json'))) {
     return false
   }
 
   const origin = headers['origin'] || headers['referer']
+
+  // If no Origin/Referer is provided:
   if (!origin) {
-    return true
+    // If request contains browser-only fetch metadata headers but missing Origin/Referer, reject
+    if (headers['sec-fetch-dest'] || headers['sec-fetch-mode'] || headers['sec-ch-ua']) {
+      return false
+    }
+    // Only allow non-browser clients if they originate from loopback IP or internal socket
+    const remoteAddr = String(req.socket?.remoteAddress || req.connection?.remoteAddress || '').trim()
+    const isLoopback = !remoteAddr ||
+      remoteAddr === '127.0.0.1' ||
+      remoteAddr === '::1' ||
+      remoteAddr === '::ffff:127.0.0.1'
+    return isLoopback
   }
 
   try {
     const originUrl = new URL(origin)
-    const hostHeader = headers['host'] || ''
-    const reqHost = hostHeader.split(':')[0]?.toLowerCase()
-    const originHost = originUrl.hostname.toLowerCase()
+    const hostHeader = String(headers['host'] || '').trim().toLowerCase()
+    if (!hostHeader) return false
 
-    if (originHost === 'localhost' || originHost === '127.0.0.1' || originHost === '::1' || originHost === '[::1]') {
+    // Parse expected host and port from Host header
+    let expectedHost = hostHeader
+    let expectedPort = ''
+    if (hostHeader.startsWith('[')) {
+      // IPv6 format: [::1]:3080
+      const closeBracket = hostHeader.indexOf(']')
+      expectedHost = hostHeader.slice(1, closeBracket)
+      expectedPort = hostHeader.slice(closeBracket + 1).replace(/^:/, '')
+    } else if (hostHeader.includes(':')) {
+      const parts = hostHeader.split(':')
+      expectedHost = parts[0]
+      expectedPort = parts[1]
+    }
+
+    const isEncrypted = Boolean(req.socket?.encrypted || req.connection?.encrypted || headers['x-forwarded-proto'] === 'https')
+    if (!expectedPort) {
+      expectedPort = isEncrypted ? '443' : '80'
+    }
+
+    const actualHost = originUrl.hostname.toLowerCase().replace(/^[\[]|[\]]$/g, '')
+    const actualPort = originUrl.port || (originUrl.protocol === 'https:' ? '443' : '80')
+
+    // 1. Strict Port Check: ports must be identical!
+    if (actualPort !== expectedPort) {
+      return false
+    }
+
+    // 2. Host Matching: must match Host header, or be an equivalent loopback alias on the same port
+    if (actualHost === expectedHost) {
       return true
     }
 
-    if (reqHost && originHost === reqHost) {
+    const loopbackAliases = new Set(['localhost', '127.0.0.1', '::1', '0.0.0.0'])
+    if (loopbackAliases.has(actualHost) && loopbackAliases.has(expectedHost)) {
       return true
     }
 
