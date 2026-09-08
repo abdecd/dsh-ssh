@@ -36,6 +36,10 @@ function resolveSessionCwd(ctx: any, exec: any): string | undefined {
     if (exec?.agent?.session?.cwd) return exec.agent.session.cwd
     if (exec?.session?.cwd) return exec.session.cwd
     if (exec?.agent?.cwd) return exec.agent.cwd
+    if (ctx?.agent?.session?.header?.cwd) return ctx.agent.session.header.cwd
+    if (ctx?.agent?.session?.cwd) return ctx.agent.session.cwd
+    if (ctx?.session?.header?.cwd) return ctx.session.header.cwd
+    if (ctx?.session?.cwd) return ctx.session.cwd
   } catch {}
   return undefined
 }
@@ -115,11 +119,12 @@ function checkToolAuth(ctx: any, host: string, exec: any) {
   return null
 }
 
-export function registerTools(ctx: any) {
+export function registerTools(ctx: any): () => void {
   const register = (tool: any) => ctx.tools.register(defineTool(tool))
+  const disposers: Array<(() => void) | undefined> = []
 
   // 1. remote_ssh_hosts
-  register({
+  disposers.push(register({
     name: 'remote_ssh_hosts',
     description: '列出当前从 ~/.ssh/config 中发现的所有可用远程主机配置，以及当前会话绑定的远程工作区状态。',
     parameters: {},
@@ -136,10 +141,10 @@ export function registerTools(ctx: any) {
         currentRemote: info ? info.meta : null
       })
     }
-  })
+  }))
 
   // 2. remote_ssh_exec
-  register({
+  disposers.push(register({
     name: 'remote_ssh_exec',
     description: '在远程 SSH 主机上执行 Shell 命令。如果在远程工作区中，可免填 host 并自动在远程工作区目录下执行。',
     parameters: {
@@ -190,10 +195,10 @@ export function registerTools(ctx: any) {
         error: r.error || null
       })
     }
-  })
+  }))
 
   // 3. remote_ssh_read
-  register({
+  disposers.push(register({
     name: 'remote_ssh_read',
     description: '读取远程主机上的文件文本内容。',
     parameters: {
@@ -227,10 +232,10 @@ export function registerTools(ctx: any) {
         truncated: Boolean(r.truncated)
       })
     }
-  })
+  }))
 
   // 4. remote_ssh_write
-  register({
+  disposers.push(register({
     name: 'remote_ssh_write',
     description: '在远程主机上创建或覆盖写入文件内容。',
     parameters: {
@@ -257,5 +262,100 @@ export function registerTools(ctx: any) {
         error: r.error || null
       })
     }
+  }))
+
+  return () => {
+    for (const dispose of disposers) {
+      try { dispose?.() } catch {}
+    }
+  }
+}
+
+/**
+ * Configure AI tools for remote workspace sessions only.
+ * Non-remote workspaces will not have remote_ssh_* tools injected into their prompt/runtime.
+ */
+export function setupRemoteTools(ctx: any): () => void {
+  const registeredAgents = new WeakSet<any>()
+  const cleanups = new Map<any, () => void>()
+
+  const maybeRegisterForAgent = (agent: any) => {
+    if (!agent || registeredAgents.has(agent)) return
+
+    const cwd = agent.session?.header?.cwd || agent.session?.cwd || agent.cwd
+    const remoteInfo = findRemoteWorkspaceMeta(cwd)
+    if (!remoteInfo) {
+      // Non-remote workspace: strictly avoid injecting exclusive remote SSH tools
+      return
+    }
+
+    const agentCtx = agent.ctx
+    if (!agentCtx?.tools?.register) {
+      if (typeof agentCtx?.inject === 'function') {
+        agentCtx.inject(['tools'], () => {
+          maybeRegisterForAgent(agent)
+        })
+      }
+      return
+    }
+
+    // If tools are already visible in this agent's scope (e.g. subagent inheriting from parent scope), skip
+    if (agentCtx.tools.get?.('remote_ssh_exec', agent)) {
+      registeredAgents.add(agent)
+      return
+    }
+
+    registeredAgents.add(agent)
+    const dispose = registerTools(agentCtx)
+    if (typeof dispose === 'function') {
+      cleanups.set(agent, dispose)
+    }
+  }
+
+  // 1. Scan already-loaded agents if agents service is present
+  try {
+    const list = ctx.agents?.list?.()
+    if (Array.isArray(list)) {
+      for (const agent of list) {
+        maybeRegisterForAgent(agent)
+      }
+    }
+  } catch {}
+
+  // 2. Also hook into agents service if it is provided later
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['agents'], (agentCtx: any) => {
+      try {
+        const list = agentCtx.agents?.list?.()
+        if (Array.isArray(list)) {
+          for (const agent of list) {
+            maybeRegisterForAgent(agent)
+          }
+        }
+      } catch {}
+    })
+  }
+
+  // 3. Hook newly created agents
+  const stopCreated = ctx.on?.('agent/created', ({ agent }: any) => {
+    maybeRegisterForAgent(agent)
   })
+
+  // 4. Cleanup when agent is disposed
+  const stopDisposed = ctx.on?.('agent/disposed', ({ agent }: any) => {
+    const dispose = cleanups.get(agent)
+    if (dispose) {
+      cleanups.delete(agent)
+      try { dispose() } catch {}
+    }
+  })
+
+  return () => {
+    stopCreated?.()
+    stopDisposed?.()
+    for (const dispose of cleanups.values()) {
+      try { dispose() } catch {}
+    }
+    cleanups.clear()
+  }
 }

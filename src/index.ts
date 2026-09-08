@@ -1,7 +1,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import { ensureShellWrapper, hookWorkspaceRegistryDeletion } from './workspace'
 import { registerFsInterceptors } from './interceptor'
-import { registerTools } from './tools'
+import { setupRemoteTools } from './tools'
 import { registerApiRoutes } from './api'
 
 export const name = 'dsh-ssh'
@@ -24,8 +24,8 @@ export function apply(ctx: Context) {
   // 3. Register exact routes to intercept /sidebar/api/fs.* for dsh-better-sidebar
   registerFsInterceptors(ctx)
 
-  // 4. Register concise AI tools: remote_ssh_exec, remote_ssh_read, etc.
-  registerTools(ctx)
+  // 4. Register concise AI tools only for remote workspace sessions: remote_ssh_exec, remote_ssh_read, etc.
+  setupRemoteTools(ctx)
 
   // 5. Register HTTP JSON API for web client (/dsh-ssh/api)
   registerApiRoutes(ctx)

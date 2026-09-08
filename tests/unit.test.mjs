@@ -762,5 +762,142 @@ test('runSsh handles early process termination without crashing on unhandled std
   }
 })
 
+test('setupRemoteTools injects tools only into remote workspace agents and never non-remote workspaces', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+  const { createRequire } = await import('node:module')
+  const { Context } = await import('@deepseek-ai/cordis')
+  const { ToolRuntime } = await import('@deepseek-ai/dsh-tools')
+  const req = createRequire(import.meta.resolve('@deepseek-ai/dsh-tools'))
+  const { createScope } = await import(req.resolve('@deepseek-ai/dsh-scope'))
+  const { setupRemoteTools } = await import('../lib/index.js')
+
+  const oldHome = process.env.HOME
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-remote-tools-test-'))
+  process.env.HOME = tempHome
+
+  const wsDir = path.join(tempHome, '.dsh', 'dsh-ssh', 'workspaces', 'ws-test')
+  const localDir = path.join(tempHome, 'local-repo')
+  fs.mkdirSync(wsDir, { recursive: true })
+  fs.mkdirSync(localDir, { recursive: true })
+  fs.mkdirSync(path.join(tempHome, '.ssh'), { recursive: true })
+  fs.writeFileSync(path.join(tempHome, '.ssh', 'config'), 'Host test-host\n  HostName 127.0.0.1\n')
+  fs.writeFileSync(path.join(wsDir, '.remote-ssh.json'), JSON.stringify({
+    host: 'test-host',
+    remotePath: '/remote/path'
+  }))
+
+  try {
+    const ctx = new Context()
+    ctx.systemPrompt = { tools: () => {}, section: () => {} }
+    ctx.set('tools', new ToolRuntime(ctx))
+
+    const cleanup = setupRemoteTools(ctx)
+
+    // Agent in remote workspace
+    const agentRemote = { id: 'agent-remote', session: { header: { cwd: wsDir } } }
+    agentRemote.ctx = createScope(ctx, agentRemote).ctx
+    ctx.emit('agent/created', { agent: agentRemote })
+
+    // Agent in local (non-remote) workspace
+    const agentLocal = { id: 'agent-local', session: { header: { cwd: localDir } } }
+    agentLocal.ctx = createScope(ctx, agentLocal).ctx
+    ctx.emit('agent/created', { agent: agentLocal })
+
+    // Verify global view has NO exclusive tools
+    const globalVisible = [...ctx.tools.view().visible.keys()]
+    assert.deepEqual(globalVisible, [], 'global tool layer must not have remote_ssh tools injected')
+
+    // Verify remote agent HAS all 4 exclusive tools
+    const remoteVisible = [...ctx.tools.view(agentRemote).visible.keys()]
+    assert(remoteVisible.includes('remote_ssh_exec'), 'remote agent must have remote_ssh_exec')
+    assert(remoteVisible.includes('remote_ssh_read'), 'remote agent must have remote_ssh_read')
+    assert(remoteVisible.includes('remote_ssh_write'), 'remote agent must have remote_ssh_write')
+    assert(remoteVisible.includes('remote_ssh_hosts'), 'remote agent must have remote_ssh_hosts')
+
+    // Verify local agent DOES NOT HAVE ANY of the 4 exclusive tools
+    const localVisible = [...ctx.tools.view(agentLocal).visible.keys()]
+    assert.deepEqual(localVisible, [], 'non-remote workspace agent must not have any remote_ssh tools')
+
+    // Child agent under remote agent inherits remote tools
+    const childRemote = { id: 'child-remote', session: { header: { cwd: wsDir } } }
+    childRemote.ctx = createScope(ctx, childRemote, { parent: agentRemote }).ctx
+    ctx.emit('agent/created', { agent: childRemote })
+    const childRemoteVisible = [...ctx.tools.view(childRemote).visible.keys()]
+    assert(childRemoteVisible.includes('remote_ssh_exec'), 'remote child must inherit remote_ssh_exec')
+
+    // Child agent under local agent has NO remote tools
+    const childLocal = { id: 'child-local', session: { header: { cwd: localDir } } }
+    childLocal.ctx = createScope(ctx, childLocal, { parent: agentLocal }).ctx
+    ctx.emit('agent/created', { agent: childLocal })
+    const childLocalVisible = [...ctx.tools.view(childLocal).visible.keys()]
+    assert.deepEqual(childLocalVisible, [], 'local child must not have any remote_ssh tools')
+
+    cleanup()
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(tempHome, { recursive: true, force: true })
+  }
+})
+
+test('setupRemoteTools handles pre-existing agents from ctx.agents.list()', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+  const { createRequire } = await import('node:module')
+  const { Context } = await import('@deepseek-ai/cordis')
+  const { ToolRuntime } = await import('@deepseek-ai/dsh-tools')
+  const req = createRequire(import.meta.resolve('@deepseek-ai/dsh-tools'))
+  const { createScope } = await import(req.resolve('@deepseek-ai/dsh-scope'))
+  const { setupRemoteTools } = await import('../lib/index.js')
+
+  const oldHome = process.env.HOME
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-preexisting-test-'))
+  process.env.HOME = tempHome
+
+  const wsDir = path.join(tempHome, '.dsh', 'dsh-ssh', 'workspaces', 'ws-test')
+  const localDir = path.join(tempHome, 'local-repo')
+  fs.mkdirSync(wsDir, { recursive: true })
+  fs.mkdirSync(localDir, { recursive: true })
+  fs.mkdirSync(path.join(tempHome, '.ssh'), { recursive: true })
+  fs.writeFileSync(path.join(tempHome, '.ssh', 'config'), 'Host test-host\n  HostName 127.0.0.1\n')
+  fs.writeFileSync(path.join(wsDir, '.remote-ssh.json'), JSON.stringify({
+    host: 'test-host',
+    remotePath: '/remote/path'
+  }))
+
+  try {
+    const ctx = new Context()
+    ctx.systemPrompt = { tools: () => {}, section: () => {} }
+    ctx.set('tools', new ToolRuntime(ctx))
+
+    const preRemoteAgent = { id: 'pre-remote', session: { header: { cwd: wsDir } } }
+    preRemoteAgent.ctx = createScope(ctx, preRemoteAgent).ctx
+    const preLocalAgent = { id: 'pre-local', session: { header: { cwd: localDir } } }
+    preLocalAgent.ctx = createScope(ctx, preLocalAgent).ctx
+
+    ctx.agents = {
+      list: () => [preRemoteAgent, preLocalAgent]
+    }
+
+    const cleanup = setupRemoteTools(ctx)
+
+    // Pre-existing remote agent should have tools registered
+    const remoteVisible = [...ctx.tools.view(preRemoteAgent).visible.keys()]
+    assert(remoteVisible.includes('remote_ssh_exec'), 'pre-existing remote agent must have remote_ssh_exec')
+
+    // Pre-existing local agent should NOT have tools registered
+    const localVisible = [...ctx.tools.view(preLocalAgent).visible.keys()]
+    assert.deepEqual(localVisible, [], 'pre-existing local agent must not have remote tools')
+
+    cleanup()
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(tempHome, { recursive: true, force: true })
+  }
+})
+
+
 
 

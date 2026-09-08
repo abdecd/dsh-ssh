@@ -6,7 +6,7 @@
 - 📂 **远程工作区**：在 DSH 中直接将远程目录添加为原生工作区；
 - ⚡ **侧边栏透明拦截**：`dsh-better-sidebar` 的文件树、查看与保存（Ctrl+S）全部透明直达远端服务器；
 - 💻 **内置终端直连**：在远程工作区打开侧栏终端，自动 `ssh -tt` 直连远端 Shell 环境；
-- 🤖 **精炼 AI 工具**：提供会话感知的 `remote_ssh_exec`、`remote_ssh_read`、`remote_ssh_write` 等精简工具，在远程会话中免填主机参数。
+- 🤖 **精炼 AI 工具**：专属工具（`remote_ssh_exec`、`remote_ssh_read`、`remote_ssh_write`、`remote_ssh_hosts`）仅按需注入远程工作区会话，普通本地工作区零污染、零干扰。
 
 ---
 
