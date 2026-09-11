@@ -36,8 +36,6 @@ function resolveSessionCwd(ctx: any, exec: any): string | undefined {
     if (exec?.agent?.session?.cwd) return exec.agent.session.cwd
     if (exec?.session?.cwd) return exec.session.cwd
     if (exec?.agent?.cwd) return exec.agent.cwd
-    if (ctx?.agent?.session?.header?.cwd) return ctx.agent.session.header.cwd
-    if (ctx?.agent?.session?.cwd) return ctx.agent.session.cwd
     if (ctx?.session?.header?.cwd) return ctx.session.header.cwd
     if (ctx?.session?.cwd) return ctx.session.cwd
   } catch {}
