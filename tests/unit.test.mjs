@@ -16,7 +16,10 @@ import {
   remoteWriteFile,
   remoteBrowseDirs,
   isSafeRequest,
-  shellCd
+  shellCd,
+  shellQuoteRemotePath,
+  SSH_CONNECTION_TIMEOUT_MS,
+  SSH_CONNECTION_TIMEOUT_SECONDS
 } from '../lib/index.js'
 
 test('parseSshConfig correctly parses ~/.ssh/config', () => {
@@ -41,6 +44,13 @@ test('localToRemotePath correctly translates paths', () => {
   // Nested subdir
   const nested = '/home/user/.dsh/dsh-ssh/workspaces/ws-123/a/b/c.txt'
   assert.equal(localToRemotePath(nested, anchor, remote), '/data/project/my-app/a/b/c.txt')
+
+  // A home-relative remote root must retain its tilde for remote shell expansion.
+  const homeRoot = '~/rss2mail'
+  assert.equal(localToRemotePath(anchor, anchor, homeRoot), homeRoot)
+  assert.equal(localToRemotePath(`${anchor}/rss2mail`, anchor, '~'), '~/rss2mail')
+  assert.equal(localToRemotePath(`${anchor}/src/file with spaces`, anchor, homeRoot), '~/rss2mail/src/file with spaces')
+  assert.equal(localToRemotePath(`${anchor}/src`, anchor, '/'), '/src')
 })
 
 test('tool outputs are guaranteed to be lossless JSON', async () => {
@@ -226,6 +236,8 @@ test('localToRemotePath prevents path traversal escapes', () => {
 
   const malicious2 = '../../../../../../etc/passwd'
   assert.throws(() => localToRemotePath(malicious2, anchor, remote), /路径遍历拦截/)
+  assert.throws(() => localToRemotePath(`${anchor}/../ws-other/file`, anchor, '~'), /路径遍历拦截/)
+  assert.throws(() => localToRemotePath('/etc/passwd', anchor, '/'), /路径遍历拦截/)
 
   // Normal nested subpaths remain intact
   const safeSub = '/home/user/.dsh/dsh-ssh/workspaces/ws-123/sub/file.txt'
@@ -337,6 +349,29 @@ test('shellCd correctly handles ~ home directory expansion', () => {
 
   const abs = shellCd('/var/log/nginx')
   assert.equal(abs, "cd '/var/log/nginx' 2>/dev/null")
+})
+
+test('home-relative remote paths expand safely for file operations', async () => {
+  const { execFileSync } = await import('node:child_process')
+  const path = await import('node:path')
+  const os = await import('node:os')
+  const fs = await import('node:fs')
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-ssh-home-'))
+  try {
+    const target = '~/rss2mail/file with spaces.txt'
+    assert.equal(shellQuoteRemotePath(target), '"$HOME"/\'rss2mail/file with spaces.txt\'')
+    assert.equal(shellQuoteRemotePath('/tmp/plain'), "'/tmp/plain'")
+    assert.equal(shellQuoteRemotePath('~'), '"$HOME"')
+    const quoted = shellQuoteRemotePath(target)
+    execFileSync('sh', ['-c', `mkdir -p "$HOME/rss2mail" && printf safe > ${quoted}`], { env: { ...process.env, HOME: home } })
+    assert.equal(fs.readFileSync(path.join(home, 'rss2mail', 'file with spaces.txt'), 'utf8'), 'safe')
+    const injection = '~/rss2mail/$(touch injected)'
+    execFileSync('sh', ['-c', `printf safe > ${shellQuoteRemotePath(injection)}`], { env: { ...process.env, HOME: home } })
+    assert.equal(fs.existsSync(path.join(home, 'injected')), false)
+    assert.equal(fs.readFileSync(path.join(home, 'rss2mail', '$(touch injected)'), 'utf8'), 'safe')
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
 })
 
 test('deleteRemoteWorkspace enforces strict anchor directory whitelist', async () => {
@@ -898,6 +933,166 @@ test('setupRemoteTools handles pre-existing agents from ctx.agents.list()', asyn
   }
 })
 
+test('generated terminal runner fails closed when remote directory is missing', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+  const { spawnSync } = await import('node:child_process')
+  const { ensureShellWrapper } = await import('../lib/index.js')
+  const oldHome = process.env.HOME
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-terminal-runner-'))
+  const anchor = path.join(home, '.dsh', 'dsh-ssh', 'workspaces', 'ws-test')
+  const bin = path.join(home, 'bin')
+  fs.mkdirSync(anchor, { recursive: true })
+  fs.mkdirSync(bin)
+  fs.mkdirSync(path.join(home, '.ssh'))
+  fs.writeFileSync(path.join(home, '.ssh', 'config'), 'Host terminal-test\n HostName 127.0.0.1\n')
+  fs.writeFileSync(path.join(anchor, '.remote-ssh.json'), JSON.stringify({ host: 'terminal-test', remotePath: '/missing/remote/project' }))
+  const fakeSsh = path.join(bin, process.platform === 'win32' ? 'ssh.cmd' : 'ssh')
+  fs.writeFileSync(fakeSsh, '#!/bin/sh\nfor arg do last="$arg"; done\n/bin/sh -c "$last"\n')
+  fs.chmodSync(fakeSsh, 0o755)
+  process.env.HOME = home
+  try {
+    ensureShellWrapper()
+    const result = spawnSync(process.execPath, [path.join(home, '.dsh', 'dsh-ssh', 'dsh-remote-shell.js')], {
+      cwd: anchor,
+      env: { ...process.env, HOME: home, PATH: `${bin}${path.delimiter}${process.env.PATH || ''}` },
+      encoding: 'utf8'
+    })
+    assert.equal(result.status, 1, `remote cd must fail instead of falling back to home: ${result.stderr}`)
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
 
+test('generated terminal runner expands remote home paths safely', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+  const { spawnSync } = await import('node:child_process')
+  const { ensureShellWrapper } = await import('../lib/index.js')
+  const oldHome = process.env.HOME
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-terminal-home-'))
+  const anchor = path.join(home, '.dsh', 'dsh-ssh', 'workspaces', 'ws-test')
+  const bin = path.join(home, 'bin')
+  fs.mkdirSync(anchor, { recursive: true })
+  fs.mkdirSync(bin)
+  fs.mkdirSync(path.join(home, '.ssh'))
+  fs.writeFileSync(path.join(home, '.ssh', 'config'), 'Host terminal-test\n HostName 127.0.0.1\n')
+  const metaPath = path.join(anchor, '.remote-ssh.json')
+  const fakeSsh = path.join(bin, 'ssh')
+  fs.writeFileSync(fakeSsh, '#!/bin/sh\nfor arg do remote="$arg"; done\nHOME="$FAKE_REMOTE_HOME" /bin/sh -c "$remote"\n')
+  fs.chmodSync(fakeSsh, 0o755)
+  const fakeShell = path.join(bin, 'fake-shell')
+  fs.writeFileSync(fakeShell, '#!/bin/sh\npwd\n')
+  fs.chmodSync(fakeShell, 0o755)
+  process.env.HOME = home
+  try {
+    ensureShellWrapper()
+    const runner = path.join(home, '.dsh', 'dsh-ssh', 'dsh-remote-shell.js')
+    const remoteHome = path.join(home, 'remote-home')
+    fs.mkdirSync(remoteHome)
+    fs.mkdirSync(path.join(remoteHome, 'project with spaces'))
+    for (const [remotePath, expected] of [
+      ['~', remoteHome],
+      ['~/', remoteHome],
+      ['~/project with spaces', path.join(remoteHome, 'project with spaces')],
+      ['/missing/remote/project', null]
+    ]) {
+      fs.writeFileSync(metaPath, JSON.stringify({ host: 'terminal-test', remotePath }))
+      const result = spawnSync(process.execPath, [runner], {
+        cwd: anchor,
+        env: { ...process.env, HOME: home, FAKE_REMOTE_HOME: remoteHome,
+          PATH: `${bin}${path.delimiter}${process.env.PATH || ''}`, SHELL: fakeShell },
+        encoding: 'utf8'
+      })
+      assert.equal(result.status, expected === null ? 1 : 0, `${remotePath}: ${result.stderr}`)
+      if (expected !== null) assert.equal(result.stdout.trim(), expected)
+    }
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
 
+test('generated terminal runner uses the shared SSH connect timeout', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+  const { spawnSync } = await import('node:child_process')
+  const { ensureShellWrapper } = await import('../lib/index.js')
+  const oldHome = process.env.HOME
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-terminal-timeout-'))
+  const anchor = path.join(home, '.dsh', 'dsh-ssh', 'workspaces', 'ws-test')
+  const bin = path.join(home, 'bin')
+  fs.mkdirSync(anchor, { recursive: true })
+  fs.mkdirSync(bin)
+  fs.mkdirSync(path.join(home, '.ssh'))
+  fs.writeFileSync(path.join(home, '.ssh', 'config'), 'Host terminal-test\n HostName 127.0.0.1\n')
+  fs.writeFileSync(path.join(anchor, '.remote-ssh.json'), JSON.stringify({ host: 'terminal-test', remotePath: '/remote/project' }))
+  const fakeSsh = path.join(bin, 'ssh')
+  fs.writeFileSync(fakeSsh, '#!/bin/sh\nprintf "%s\\n" "$@"\n')
+  fs.chmodSync(fakeSsh, 0o755)
+  process.env.HOME = home
+  try {
+    ensureShellWrapper()
+    const result = spawnSync(process.execPath, [path.join(home, '.dsh', 'dsh-ssh', 'dsh-remote-shell.js')], {
+      cwd: anchor,
+      env: { ...process.env, HOME: home, PATH: `${bin}${path.delimiter}${process.env.PATH || ''}` },
+      encoding: 'utf8'
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(SSH_CONNECTION_TIMEOUT_MS, SSH_CONNECTION_TIMEOUT_SECONDS * 1000)
+    assert.ok(result.stdout.split(/\r?\n/).includes(`ConnectTimeout=${SSH_CONNECTION_TIMEOUT_SECONDS}`))
+    assert.match(result.stdout, /terminal-test/)
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('native terminal hook routes only managed remote workspaces through SSH wrapper', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+  const { hookNativeTerminals, ensureShellWrapper } = await import('../lib/index.js')
+  const oldHome = process.env.HOME
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-terminal-hook-'))
+  const anchor = path.join(home, '.dsh', 'dsh-ssh', 'workspaces', 'ws-test')
+  const local = path.join(home, 'local')
+  fs.mkdirSync(path.join(anchor, 'src'), { recursive: true })
+  fs.mkdirSync(path.join(home, '.ssh'), { recursive: true })
+  fs.mkdirSync(local)
+  fs.writeFileSync(path.join(home, '.ssh', 'config'), 'Host test-terminal\n HostName 127.0.0.1\n')
+  fs.writeFileSync(path.join(anchor, '.remote-ssh.json'), JSON.stringify({ host: 'test-terminal', remotePath: '/remote/project' }))
+  process.env.HOME = home
+  try {
+    ensureShellWrapper()
+    const calls = []
+    const subprocess = { spawnTerminal(spec) { calls.push(spec); return spec } }
+    const original = subprocess.spawnTerminal
+    const agent = { ctx: { get: (name) => name === 'subprocess' ? subprocess : undefined } }
+    let onCreate
+    const cleanup = hookNativeTerminals({
+      on(event, callback) { if (event === 'agent/created') onCreate = callback; return () => {} },
+      effect() {}
+    })
+    onCreate({ agent })
+    const remoteSpec = { cwd: path.join(anchor, 'src'), argv: ['/bin/bash', '-i'], shellActivity: true, cols: 80 }
+    const remote = subprocess.spawnTerminal(remoteSpec)
+    assert.deepEqual(remote.argv, [process.execPath, path.join(home, '.dsh', 'dsh-ssh', 'dsh-remote-shell.js')])
+    assert.equal(remote.shellActivity, false)
+    assert.equal(remote.cols, 80)
+    assert.deepEqual(remoteSpec.argv, ['/bin/bash', '-i'], 'original request must not be mutated')
+    const localSpec = { cwd: local, argv: ['/bin/bash', '-i'], shellActivity: true }
+    assert.equal(subprocess.spawnTerminal(localSpec), localSpec, 'local terminals must remain unchanged')
+    assert.equal(calls.length, 2)
+    cleanup()
+    assert.equal(subprocess.spawnTerminal, original, 'hook must be reversible')
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
 

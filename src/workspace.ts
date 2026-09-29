@@ -3,6 +3,7 @@ import { join, dirname, basename, resolve, sep, posix } from 'node:path'
 import { homedir } from 'node:os'
 import { isValidSshHost } from './config'
 import { closeSshConnection } from './connection'
+import { SSH_CONNECTION_TIMEOUT_SECONDS } from './timeout'
 
 export interface RemoteWorkspaceMeta {
   host: string
@@ -81,7 +82,7 @@ export function localToRemotePath(localPath: string, anchorDir: string, remoteRo
 
   const normLocal = posix.normalize(localPath.replace(/\\/g, '/'))
   const normAnchor = posix.normalize(anchorDir.replace(/\\/g, '/'))
-  const cleanBase = posix.normalize(remoteRoot.replace(/\\/g, '/'))
+  const cleanBase = posix.normalize(remoteRoot.replace(/\\/g, '/')).replace(/\/$/, '') || '/'
 
   if (normLocal === normAnchor) {
     return cleanBase
@@ -95,24 +96,20 @@ export function localToRemotePath(localPath: string, anchorDir: string, remoteRo
   } else if (!normLocal.startsWith('/')) {
     rel = normLocal
   } else {
-    rel = posix.relative(normAnchor, normLocal)
+    // Absolute paths outside the local anchor must never map into the remote
+    // root, even when the remote root itself is /.
+    throw new Error(`路径遍历拦截：拒绝访问超出远程工作区的路径 "${localPath}"`)
   }
 
   if (!rel || rel === '.') return cleanBase
 
-  // Resolve target path against cleanBase
-  const candidate = posix.resolve(cleanBase, rel)
-
-  // Containment check: candidate must stay within cleanBase
-  const baseWithSlash = cleanBase.endsWith('/') ? cleanBase : cleanBase + '/'
-  const isWithin = candidate === cleanBase || candidate.startsWith(baseWithSlash)
-
-  // If candidate escapes cleanBase, or relative path escapes via ../, reject immediately
-  if (!isWithin || rel.startsWith('../') || rel === '..') {
+  // posix.resolve treats a leading ~ as a literal cwd-relative component.
+  // Keep the remote root's spelling intact so shellCd can expand ~/... on
+  // the remote host. Validate the local relative path before joining it.
+  if (rel.startsWith('../') || rel === '..') {
     throw new Error(`路径遍历拦截：拒绝访问超出远程工作区的路径 "${localPath}"`)
   }
-
-  return candidate
+  return posix.join(cleanBase, rel)
 }
 
 /**
@@ -344,17 +341,29 @@ if (meta && meta.host && typeof meta.host === 'string') {
     console.error('[dsh-ssh] 非法或未在 ~/.ssh/config 中配置的 SSH 主机: ' + host);
     process.exit(1);
   }
-  const remotePath = meta.remotePath;
-  let remoteCmd = undefined;
-  if (remotePath) {
-    remoteCmd = 'cd ' + shellQuote(remotePath) + ' 2>/dev/null; exec \${SHELL:-/bin/bash} -l';
+  if (typeof meta.remotePath !== 'string' || !meta.remotePath) {
+    console.error('[dsh-ssh] 远程工作区路径无效');
+    process.exit(1);
   }
-  const socketPath = path.join(os.homedir(), '.dsh', 'dsh-ssh', 'sockets', '%r@%h:%p');
-  const args = ['-o', 'ControlMaster=auto', '-o', 'ControlPath=' + socketPath, '-tt', '--', host];
-  if (remoteCmd) args.push(remoteCmd);
+  // The anchor has no mirrored directories locally: the terminal starts at
+  // its root even when a session stores a nested working directory.
+  const remotePath = meta.remotePath;
+  // Quoting a leading ~ prevents shell expansion (cd '~' looks for a literal
+  // directory named ~). Expand only the home prefix, quote the remainder.
+  const remoteDir = remotePath === '~' || remotePath === '~/' ? '"$HOME"'
+    : remotePath.startsWith('~/') ? '"$HOME"/' + shellQuote(remotePath.slice(2))
+    : shellQuote(remotePath);
+  const remoteCmd = 'cd ' + remoteDir + ' || exit 1; exec \${SHELL:-/bin/bash} -l';
+  const socketDir = path.join(os.homedir(), '.dsh', 'dsh-ssh', 'sockets');
+  fs.mkdirSync(socketDir, { recursive: true, mode: 0o700 });
+  const socketPath = path.join(socketDir, '%r@%h:%p');
+  // Override any shorter SSH config timeout for slow password-based hosts.
+  const args = ['-o', 'ConnectTimeout=${SSH_CONNECTION_TIMEOUT_SECONDS}', '-o', 'ControlMaster=auto', '-o', 'ControlPath=' + socketPath,
+    '-o', 'ControlPersist=10m', '-tt', '--', host, remoteCmd];
 
   const child = spawn('ssh', args, { stdio: 'inherit' });
-  child.on('exit', (c) => process.exit(c ?? 0));
+  child.on('error', (err) => { console.error('[dsh-ssh] SSH 启动失败:', err.message); process.exitCode = 1; });
+  child.on('exit', (c, signal) => { process.exitCode = c ?? (signal ? 128 : 1); });
 } else {
   const defaultShell = process.platform === 'win32' ? 'powershell.exe' : (process.env.SHELL || '/bin/bash');
   const child = spawn(defaultShell, process.platform === 'win32' ? [] : ['-l'], { stdio: 'inherit' });

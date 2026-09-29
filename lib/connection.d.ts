@@ -46,6 +46,8 @@ export declare function removeHostPassword(host: string): void;
  */
 export declare function closeSshConnection(host: string): Promise<void>;
 export declare function shellQuote(p: string): string;
+/** Quote a remote path while expanding only a leading home-directory prefix. */
+export declare function shellQuoteRemotePath(p: string): string;
 /**
  * Generate a safe cd command that correctly expands ~ (tilde) to $HOME
  * while keeping all subpaths strictly POSIX shell quoted.

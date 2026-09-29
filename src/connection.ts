@@ -3,6 +3,7 @@ import { mkdirSync, existsSync, chmodSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { isValidSshHost } from './config'
+import { SSH_CONNECTION_TIMEOUT_MS } from './timeout'
 
 const MAX_FILE_BYTES = 10 * 1024 * 1024 // 10MB file size limit
 const MAX_STDOUT_BYTES = 16 * 1024 * 1024 // 16MB stream buffer to accommodate Base64 transfer overhead
@@ -114,6 +115,13 @@ function getSocketDir(): string {
 export function shellQuote(p: string): string {
   if (!p) return "''"
   return "'" + String(p).replace(/'/g, "'\\''") + "'"
+}
+
+/** Quote a remote path while expanding only a leading home-directory prefix. */
+export function shellQuoteRemotePath(p: string): string {
+  if (p === '~' || p === '~/') return '"$HOME"'
+  if (p.startsWith('~/')) return `"$HOME"/${shellQuote(p.slice(2))}`
+  return shellQuote(p)
 }
 
 /**
@@ -491,11 +499,12 @@ export async function remoteReadFile(
   }
 
   // Stat file size first, verify within MAX_FILE_BYTES, then stream Base64 with size and EOF markers
-  const script = `( [ -f ${shellQuote(remotePath)} ] || { echo '__DSH_ERR_NOT_FOUND__'; exit 1; }; ` +
-    `SIZE=$(wc -c < ${shellQuote(remotePath)} 2>/dev/null || stat -c %s ${shellQuote(remotePath)} 2>/dev/null || echo 0); ` +
+  const quotedPath = shellQuoteRemotePath(remotePath)
+  const script = `( [ -f ${quotedPath} ] || { echo '__DSH_ERR_NOT_FOUND__'; exit 1; }; ` +
+    `SIZE=$(wc -c < ${quotedPath} 2>/dev/null || stat -c %s ${quotedPath} 2>/dev/null || echo 0); ` +
     `if [ "$SIZE" -gt ${MAX_FILE_BYTES} ]; then echo "__DSH_ERR_TOO_LARGE__:$SIZE"; exit 1; fi; ` +
     `echo "__DSH_FILE_SIZE__:$SIZE"; ` +
-    `base64 < ${shellQuote(remotePath)} 2>/dev/null; ` +
+    `base64 < ${quotedPath} 2>/dev/null; ` +
     `echo ""; ` +
     `echo "__DSH_READ_EOF__"; )`
 
@@ -586,22 +595,24 @@ export async function remoteWriteFile(
 
   const dirname = remotePath.split('/').slice(0, -1).join('/') || '.'
   const tmpPath = `${remotePath}.dsh-tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-  const script = `mkdir -p ${shellQuote(dirname)} && ` +
-    `( touch ${shellQuote(tmpPath)} 2>/dev/null && chmod 600 ${shellQuote(tmpPath)} 2>/dev/null && ` +
-    `base64 -d > ${shellQuote(tmpPath)} && ` +
-    `if [ -e ${shellQuote(remotePath)} ]; then ` +
-    `chmod --reference=${shellQuote(remotePath)} ${shellQuote(tmpPath)} 2>/dev/null || { ` +
-    `MODE=$(stat -c %a ${shellQuote(remotePath)} 2>/dev/null || stat -f %OLp ${shellQuote(remotePath)} 2>/dev/null || stat -f %Lp ${shellQuote(remotePath)} 2>/dev/null); ` +
-    `[ -n "$MODE" ] && chmod "$MODE" ${shellQuote(tmpPath)} 2>/dev/null; }; ` +
+  const quotedPath = shellQuoteRemotePath(remotePath)
+  const quotedTmp = shellQuoteRemotePath(tmpPath)
+  const script = `mkdir -p ${shellQuoteRemotePath(dirname)} && ` +
+    `( touch ${quotedTmp} 2>/dev/null && chmod 600 ${quotedTmp} 2>/dev/null && ` +
+    `base64 -d > ${quotedTmp} && ` +
+    `if [ -e ${quotedPath} ]; then ` +
+    `chmod --reference=${quotedPath} ${quotedTmp} 2>/dev/null || { ` +
+    `MODE=$(stat -c %a ${quotedPath} 2>/dev/null || stat -f %OLp ${quotedPath} 2>/dev/null || stat -f %Lp ${quotedPath} 2>/dev/null); ` +
+    `[ -n "$MODE" ] && chmod "$MODE" ${quotedTmp} 2>/dev/null; }; ` +
     `else ` +
     `UM=$(umask 2>/dev/null || echo 077); ` +
     `CLEAN_UM=$(echo "$UM" | sed 's/^0*//' 2>/dev/null); ` +
     `[ -z "$CLEAN_UM" ] && CLEAN_UM="0"; ` +
     `MODE=$(printf '%03o' $(( 0666 & ~0$CLEAN_UM )) 2>/dev/null || echo 600); ` +
-    `chmod "$MODE" ${shellQuote(tmpPath)} 2>/dev/null || chmod 600 ${shellQuote(tmpPath)} 2>/dev/null; ` +
+    `chmod "$MODE" ${quotedTmp} 2>/dev/null || chmod 600 ${quotedTmp} 2>/dev/null; ` +
     `fi && ` +
-    `mv -f ${shellQuote(tmpPath)} ${shellQuote(remotePath)} ) || ` +
-    `{ rm -f ${shellQuote(tmpPath)} 2>/dev/null; exit 1; }`
+    `mv -f ${quotedTmp} ${quotedPath} ) || ` +
+    `{ rm -f ${quotedTmp} 2>/dev/null; exit 1; }`
 
   const r = await runSsh(host, script, b64)
   invalidateCache(host, remotePath)
@@ -668,7 +679,7 @@ export async function testSshConnection(host: string, password?: string): Promis
     host,
     'echo "OK"',
     undefined,
-    8000,
+    SSH_CONNECTION_TIMEOUT_MS,
     hasPassword
       ? { password, disableConnectionReuse: true, passwordOnly: true }
       : undefined
@@ -706,7 +717,7 @@ export async function remoteBrowseDirs(
     `echo '__DSH_SEP__'; ` +
     `{ find . -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f\\n' 2>/dev/null || ls -1dp */ 2>/dev/null; } | sort -f | head -n 201 )`
 
-  const r = await runSsh(host, script, undefined, 8000)
+  const r = await runSsh(host, script, undefined, SSH_CONNECTION_TIMEOUT_MS)
   if (!r.ok) {
     if (r.stdout.includes('__DSH_ERR_CD__')) {
       return { ok: false, error: `无法访问该远程目录（不存在或无权限）: ${p}` }

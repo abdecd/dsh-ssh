@@ -3,6 +3,7 @@ import { ensureShellWrapper, hookWorkspaceRegistryDeletion } from './workspace'
 import { registerFsInterceptors } from './interceptor'
 import { setupRemoteTools } from './tools'
 import { registerApiRoutes } from './api'
+import { hookNativeTerminals } from './terminal'
 
 export const name = 'dsh-ssh'
 export const inject = ['webServer', 'tools', 'workspaceRegistry']
@@ -10,12 +11,15 @@ export const inject = ['webServer', 'tools', 'workspaceRegistry']
 export * from './config'
 export * from './workspace'
 export * from './connection'
+export * from './timeout'
 export * from './interceptor'
 export * from './tools'
+export * from './terminal'
 
 export function apply(ctx: Context) {
   // 1. Ensure the terminal shell wrapper is generated in ~/.dsh/dsh-ssh/
   ensureShellWrapper()
+  hookNativeTerminals(ctx)
 
   // 2. Hook workspaceRegistry deletion so removing a workspace in DSH
   // immediately deletes its corresponding anchor directory in ~/.dsh/dsh-ssh/workspaces/
