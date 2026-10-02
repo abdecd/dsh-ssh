@@ -34,14 +34,17 @@ export function hookNativeTerminals(ctx: any): () => void {
   try { install(ctx.get?.('subprocess')) } catch { /* optional */ }
   try { for (const agent of ctx.agents?.list?.() || []) installAgent(agent) } catch {}
   const stopCreated = ctx.on?.('agent/created', ({ agent }: any) => installAgent(agent))
-  const stopReady = ctx.inject?.(['agents', 'subprocess'], (scoped: any) => {
+  const stopSubprocess = ctx.inject?.(['subprocess'], (scoped: any) => {
     install(scoped.subprocess)
+  })
+  const stopAgents = ctx.inject?.(['agents'], (scoped: any) => {
     for (const agent of scoped.agents?.list?.() || []) installAgent(agent)
   })
 
   const cleanup = () => {
     stopCreated?.()
-    stopReady?.()
+    stopSubprocess?.()
+    stopAgents?.()
     for (const provider of providers) {
       const entry = wrapped.get(provider)
       if (entry && provider.spawnTerminal === entry.wrapper) provider.spawnTerminal = entry.original

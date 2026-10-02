@@ -22,11 +22,48 @@ import {
   SSH_CONNECTION_TIMEOUT_SECONDS
 } from '../lib/index.js'
 
-test('parseSshConfig correctly parses ~/.ssh/config', () => {
-  const hosts = parseSshConfig()
-  assert(Array.isArray(hosts), 'hosts should be an array')
-  console.log('Parsed hosts from ~/.ssh/config:', hosts.map((h) => h.host))
-  assert(hosts.length > 0, 'should have parsed at least one host')
+function restoreHome(oldHome) {
+  if (oldHome === undefined) delete process.env.HOME
+  else process.env.HOME = oldHome
+}
+
+test('parseSshConfig correctly parses ~/.ssh/config with isolated fixture', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), `dsh-ssh-parse-test-${Date.now()}-`))
+  const sshDir = path.join(tempHome, '.ssh')
+  fs.mkdirSync(sshDir, { recursive: true })
+  fs.writeFileSync(
+    path.join(sshDir, 'config'),
+    `
+Host isolated-host-1
+  HostName 192.168.1.101
+  User root
+  Port 22
+
+Host isolated-host-2
+  HostName 192.168.1.102
+  User ubuntu
+  IdentityFile ~/.ssh/id_rsa
+`,
+    'utf8'
+  )
+
+  const oldHome = process.env.HOME
+  process.env.HOME = tempHome
+  try {
+    const hosts = parseSshConfig()
+    assert(Array.isArray(hosts), 'hosts should be an array')
+    assert.equal(hosts.length, 2, 'should parse exactly 2 hosts from isolated fixture')
+    assert.equal(hosts[0].host, 'isolated-host-1')
+    assert.equal(hosts[0].hostName, '192.168.1.101')
+    assert.equal(hosts[1].host, 'isolated-host-2')
+    assert.equal(hosts[1].user, 'ubuntu')
+  } finally {
+    restoreHome(oldHome)
+    fs.rmSync(tempHome, { recursive: true, force: true })
+  }
 })
 
 test('localToRemotePath correctly translates paths', () => {
@@ -126,7 +163,7 @@ test('hookWorkspaceRegistryDeletion removes anchor directory upon deletion', asy
     await mockRegistry.delete('test-ws-id')
     assert(!fs.existsSync(fakeAnchor), 'anchor directory must be deleted immediately after workspace delete')
   } finally {
-    process.env.HOME = oldHome
+    restoreHome(oldHome)
     fs.rmSync(fakeHome, { recursive: true, force: true })
   }
 })
@@ -217,13 +254,24 @@ Host -oProxyCommand=calc
 })
 
 test('runSsh rejects unvalidated hosts before spawning ssh', async () => {
-  const r1 = await runSsh('-oProxyCommand=evil', 'echo 1')
-  assert.equal(r1.ok, false)
-  assert(r1.error?.includes('主机校验失败'))
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+  const oldHome = process.env.HOME
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), `dsh-ssh-unval-test-${Date.now()}-`))
+  process.env.HOME = tempHome
+  try {
+    const r1 = await runSsh('-oProxyCommand=evil', 'echo 1')
+    assert.equal(r1.ok, false)
+    assert(r1.error?.includes('主机校验失败'))
 
-  const r2 = await runSsh('unknown-host-123456', 'echo 1')
-  assert.equal(r2.ok, false)
-  assert(r2.error?.includes('主机校验失败'))
+    const r2 = await runSsh('unknown-host-123456', 'echo 1')
+    assert.equal(r2.ok, false)
+    assert(r2.error?.includes('主机校验失败'))
+  } finally {
+    restoreHome(oldHome)
+    fs.rmSync(tempHome, { recursive: true, force: true })
+  }
 })
 
 test('localToRemotePath prevents path traversal escapes', () => {
@@ -282,7 +330,7 @@ test('findRemoteWorkspaceMeta resolves deep subdirectories in managed workspaces
     const unmanagedFound = findRemoteWorkspaceMeta(unmanagedDir)
     assert.equal(unmanagedFound, null, 'must reject unmanaged project outside workspaces directory')
   } finally {
-    process.env.HOME = oldHome
+    restoreHome(oldHome)
     fs.rmSync(fakeHome, { recursive: true, force: true })
   }
 })
@@ -410,7 +458,7 @@ test('deleteRemoteWorkspace enforces strict anchor directory whitelist', async (
     assert.equal(resValid.ok, true)
     assert(!fs.existsSync(validSub), 'valid workspace anchor directory should be deleted')
   } finally {
-    process.env.HOME = oldHome
+    restoreHome(oldHome)
     fs.rmSync(fakeHome, { recursive: true, force: true })
   }
 })
@@ -474,23 +522,38 @@ test('registerFsInterceptors passes through local workspace requests to original
 })
 
 test('remoteBrowseDirs blocks dangerous characters and unvalidated hosts', async () => {
-  // 1. Invalid path characters (newlines, null bytes) must be blocked
-  const res1 = await remoteBrowseDirs('orangepi', '/tmp/foo\nrm -rf /')
-  assert.equal(res1.ok, false)
-  assert(res1.error?.includes('非法路径字符'))
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
 
-  const res2 = await remoteBrowseDirs('orangepi', '/tmp/foo\0bar')
-  assert.equal(res2.ok, false)
-  assert(res2.error?.includes('非法路径字符'))
+  const oldHome = process.env.HOME
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), `dsh-browse-test-${Date.now()}-`))
+  const sshDir = path.join(tempHome, '.ssh')
+  fs.mkdirSync(sshDir, { recursive: true })
+  fs.writeFileSync(path.join(sshDir, 'config'), 'Host orangepi\n  HostName 192.168.1.100\n', 'utf8')
+  process.env.HOME = tempHome
+  try {
+    // 1. Invalid path characters (newlines, null bytes) must be blocked
+    const res1 = await remoteBrowseDirs('orangepi', '/tmp/foo\nrm -rf /')
+    assert.equal(res1.ok, false)
+    assert(res1.error?.includes('非法路径字符'))
 
-  // 2. Unconfigured / malicious hosts must be rejected immediately by host validation
-  const res3 = await remoteBrowseDirs('-oProxyCommand=evil', '/var/www')
-  assert.equal(res3.ok, false)
-  assert(res3.error?.includes('主机校验失败'))
+    const res2 = await remoteBrowseDirs('orangepi', '/tmp/foo\0bar')
+    assert.equal(res2.ok, false)
+    assert(res2.error?.includes('非法路径字符'))
 
-  const res4 = await remoteBrowseDirs('non-existent-host-xyz', '/var/www')
-  assert.equal(res4.ok, false)
-  assert(res4.error?.includes('主机校验失败'))
+    // 2. Unconfigured / malicious hosts must be rejected immediately by host validation
+    const res3 = await remoteBrowseDirs('-oProxyCommand=evil', '/var/www')
+    assert.equal(res3.ok, false)
+    assert(res3.error?.includes('主机校验失败'))
+
+    const res4 = await remoteBrowseDirs('non-existent-host-xyz', '/var/www')
+    assert.equal(res4.ok, false)
+    assert(res4.error?.includes('主机校验失败'))
+  } finally {
+    restoreHome(oldHome)
+    fs.rmSync(tempHome, { recursive: true, force: true })
+  }
 })
 
 test('workspace deletion keeps case-sensitive POSIX paths outside the allowlist', async () => {
@@ -518,7 +581,7 @@ test('workspace deletion keeps case-sensitive POSIX paths outside the allowlist'
     await mockRegistry.delete('ordinary-project')
     assert(fs.existsSync(path.join(caseVariantAnchor, 'sentinel')), 'case-distinct path must not be treated as an anchor')
   } finally {
-    process.env.HOME = oldHome
+    restoreHome(oldHome)
     fs.rmSync(fakeHome, { recursive: true, force: true })
   }
 })
@@ -562,7 +625,7 @@ test('remote_ssh_exec does not run a command when cwd cannot be entered', async 
     assert.equal(result.ok, false, 'failed cwd must fail the SSH command')
     assert.equal(fs.existsSync(marker), false, 'command must not run after cwd failure')
   } finally {
-    process.env.HOME = oldHome
+    restoreHome(oldHome)
     if (oldPath === undefined) delete process.env.PATH
     else process.env.PATH = oldPath
     fs.rmSync(tempRoot, { recursive: true, force: true })
@@ -606,7 +669,7 @@ test('password verification bypasses cached credentials and disables SSH reuse',
   } finally {
     removeHostPassword('password-fixture')
     delete process.env.DSH_TEST_SSHPASS_ARGS
-    process.env.HOME = oldHome
+    restoreHome(oldHome)
     if (oldPath === undefined) delete process.env.PATH
     else process.env.PATH = oldPath
     fs.rmSync(tempRoot, { recursive: true, force: true })
@@ -656,7 +719,7 @@ test('remoteWriteFile preserves existing file permissions and does not loosen mo
     assert.equal(res2.ok, true)
     assert.equal((fs.statSync(execFile).mode & 0o777).toString(8), '755', '0755 mode must be preserved')
   } finally {
-    process.env.HOME = oldHome
+    restoreHome(oldHome)
     if (oldPath === undefined) delete process.env.PATH
     else process.env.PATH = oldPath
     fs.rmSync(tempRoot, { recursive: true, force: true })
@@ -712,7 +775,7 @@ test('remoteReadFile handles files over 7.5MB without truncation and rejects cor
     assert.equal(corruptRes.ok, false)
     assert.match(corruptRes.error || '', /未完成|校验失败/)
   } finally {
-    process.env.HOME = oldHome
+    restoreHome(oldHome)
     if (oldPath === undefined) delete process.env.PATH
     else process.env.PATH = oldPath
     fs.rmSync(tempRoot, { recursive: true, force: true })
@@ -755,7 +818,7 @@ test('remoteWriteFile respects strict remote umask for new files and avoids unco
     assert.equal(resStandard.ok, true)
     assert.equal((fs.statSync(fileUnderStandard).mode & 0o777).toString(8), '644', 'new file under umask 022 must be 0644')
   } finally {
-    process.env.HOME = oldHome
+    restoreHome(oldHome)
     if (oldPath === undefined) delete process.env.PATH
     else process.env.PATH = oldPath
     fs.rmSync(tempRoot, { recursive: true, force: true })
@@ -790,7 +853,7 @@ test('runSsh handles early process termination without crashing on unhandled std
     assert.equal(result.ok, false)
     assert.equal(result.exitCode, 1)
   } finally {
-    process.env.HOME = oldHome
+    restoreHome(oldHome)
     if (oldPath === undefined) delete process.env.PATH
     else process.env.PATH = oldPath
     fs.rmSync(tempRoot, { recursive: true, force: true })
@@ -871,7 +934,7 @@ test('setupRemoteTools injects tools only into remote workspace agents and never
 
     cleanup()
   } finally {
-    process.env.HOME = oldHome
+    restoreHome(oldHome)
     fs.rmSync(tempHome, { recursive: true, force: true })
   }
 })
@@ -928,7 +991,7 @@ test('setupRemoteTools handles pre-existing agents from ctx.agents.list()', asyn
 
     cleanup()
   } finally {
-    process.env.HOME = oldHome
+    restoreHome(oldHome)
     fs.rmSync(tempHome, { recursive: true, force: true })
   }
 })
@@ -961,7 +1024,7 @@ test('generated terminal runner fails closed when remote directory is missing', 
     })
     assert.equal(result.status, 1, `remote cd must fail instead of falling back to home: ${result.stderr}`)
   } finally {
-    process.env.HOME = oldHome
+    restoreHome(oldHome)
     fs.rmSync(home, { recursive: true, force: true })
   }
 })
@@ -1011,7 +1074,7 @@ test('generated terminal runner expands remote home paths safely', async () => {
       if (expected !== null) assert.equal(result.stdout.trim(), expected)
     }
   } finally {
-    process.env.HOME = oldHome
+    restoreHome(oldHome)
     fs.rmSync(home, { recursive: true, force: true })
   }
 })
@@ -1047,7 +1110,7 @@ test('generated terminal runner uses the shared SSH connect timeout', async () =
     assert.ok(result.stdout.split(/\r?\n/).includes(`ConnectTimeout=${SSH_CONNECTION_TIMEOUT_SECONDS}`))
     assert.match(result.stdout, /terminal-test/)
   } finally {
-    process.env.HOME = oldHome
+    restoreHome(oldHome)
     fs.rmSync(home, { recursive: true, force: true })
   }
 })
@@ -1091,7 +1154,152 @@ test('native terminal hook routes only managed remote workspaces through SSH wra
     cleanup()
     assert.equal(subprocess.spawnTerminal, original, 'hook must be reversible')
   } finally {
-    process.env.HOME = oldHome
+    restoreHome(oldHome)
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('DSH 0.2.0-rc.2 target cohort and peer dependencies integrity', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const pkgPath = path.resolve('package.json')
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'))
+
+  // 1. Package self version and naming
+  assert.equal(pkg.name, 'dsh-ssh')
+  assert.equal(pkg.version, '0.1.0')
+
+  // 2. DSH manifest fields
+  assert.equal(pkg.dsh?.bundle?.patch, './cordis.patch.yml')
+  assert.equal(pkg.dsh?.client?.platform, 'web')
+  assert.deepEqual(pkg.dsh?.client?.inject, [
+    '@deepseek-ai/dsh-client-locale',
+    '@deepseek-ai/dsh-client-ui-slots',
+    '@deepseek-ai/dsh-client-ui-primitives'
+  ])
+
+  // 3. Peer dependencies: DSH packages must be ^0.2.0-rc.2, cordis ^4.0.1
+  assert.equal(pkg.peerDependencies['@deepseek-ai/cordis'], '^4.0.1')
+  assert.equal(pkg.peerDependencies['@deepseek-ai/dsh-host-webserver'], '^0.2.0-rc.2')
+  assert.equal(pkg.peerDependencies['@deepseek-ai/dsh-tools'], '^0.2.0-rc.2')
+  assert.equal(pkg.peerDependencies['@deepseek-ai/dsh-workspace'], '^0.2.0-rc.2')
+
+  // 4. Dev dependencies: DSH packages must be exact 0.2.0-rc.2, cordis 4.0.4
+  assert.equal(pkg.devDependencies['@deepseek-ai/cordis'], '4.0.4')
+  assert.equal(pkg.devDependencies['@deepseek-ai/dsh-host-webserver'], '0.2.0-rc.2')
+  assert.equal(pkg.devDependencies['@deepseek-ai/dsh-tools'], '0.2.0-rc.2')
+  assert.equal(pkg.devDependencies['@deepseek-ai/dsh-workspace'], '0.2.0-rc.2')
+
+  // 5. Installed packages in node_modules must resolve to 0.2.0-rc.2 and cordis 4.0.4
+  const { createRequire } = await import('node:module')
+  const req = createRequire(import.meta.url)
+  const cordisPkg = JSON.parse(fs.readFileSync(req.resolve('@deepseek-ai/cordis/package.json'), 'utf8'))
+  const webserverPkg = JSON.parse(fs.readFileSync(req.resolve('@deepseek-ai/dsh-host-webserver/package.json'), 'utf8'))
+  const toolsPkg = JSON.parse(fs.readFileSync(req.resolve('@deepseek-ai/dsh-tools/package.json'), 'utf8'))
+  const wsPkg = JSON.parse(fs.readFileSync(req.resolve('@deepseek-ai/dsh-workspace/package.json'), 'utf8'))
+
+  assert.equal(cordisPkg.version, '4.0.4')
+  assert.equal(webserverPkg.version, '0.2.0-rc.2')
+  assert.equal(toolsPkg.version, '0.2.0-rc.2')
+  assert.equal(wsPkg.version, '0.2.0-rc.2')
+})
+
+test('native node built entry is side-effect-free on import', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+  const { spawnSync } = await import('node:child_process')
+
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), `dsh-import-test-${Date.now()}-`))
+  try {
+    const code = `
+      import * as plugin from './lib/index.js'
+      import assert from 'node:assert/strict'
+      import fs from 'node:fs'
+      import path from 'node:path'
+      import os from 'node:os'
+
+      assert.equal(plugin.name, 'dsh-ssh')
+      assert.deepEqual(plugin.inject, ['webServer', 'tools', 'workspaceRegistry'])
+      assert.equal(typeof plugin.apply, 'function')
+      assert.equal(typeof plugin.default.apply, 'function')
+
+      // Ensure no .dsh or sockets directory was created simply by importing
+      const dshDir = path.join(os.homedir(), '.dsh')
+      assert.equal(fs.existsSync(dshDir), false, 'importing module must have zero side-effects')
+      console.log('SIDE_EFFECT_FREE_OK')
+    `
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', code], {
+      cwd: path.resolve('.'),
+      env: { ...process.env, HOME: tempHome },
+      encoding: 'utf8'
+    })
+    assert.equal(result.status, 0, `import failed with stderr: ${result.stderr}`)
+    assert(result.stdout.includes('SIDE_EFFECT_FREE_OK'))
+  } finally {
+    fs.rmSync(tempHome, { recursive: true, force: true })
+  }
+})
+
+test('hookNativeTerminals handles delayed subprocess injection and agent lifecycle', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+  const { hookNativeTerminals, ensureShellWrapper } = await import('../lib/index.js')
+  const oldHome = process.env.HOME
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-terminal-lifecycle-'))
+  const anchor = path.join(home, '.dsh', 'dsh-ssh', 'workspaces', 'ws-test')
+  fs.mkdirSync(path.join(anchor, 'src'), { recursive: true })
+  fs.mkdirSync(path.join(home, '.ssh'), { recursive: true })
+  fs.writeFileSync(path.join(home, '.ssh', 'config'), 'Host test-terminal\n HostName 127.0.0.1\n')
+  fs.writeFileSync(path.join(anchor, '.remote-ssh.json'), JSON.stringify({ host: 'test-terminal', remotePath: '/remote/project' }))
+  process.env.HOME = home
+  try {
+    ensureShellWrapper()
+    const calls = []
+    const subprocess1 = { spawnTerminal(spec) { calls.push(spec); return spec } }
+    const subprocess2 = { spawnTerminal(spec) { calls.push(spec); return spec } }
+
+    const callbacks = new Map()
+    const mockCtx = {
+      get(name) { return name === 'subprocess' ? subprocess1 : undefined },
+      on(event, cb) {
+        callbacks.set(event, cb)
+        return () => callbacks.delete(event)
+      },
+      inject(deps, cb) {
+        if (deps.includes('subprocess')) cb({ subprocess: subprocess2 })
+        return () => {}
+      },
+      effect() {}
+    }
+
+    const cleanup = hookNativeTerminals(mockCtx)
+
+    // Test subprocess1 (from ctx.get)
+    const spec1 = { cwd: path.join(anchor, 'src'), argv: ['bash'], shellActivity: true }
+    const res1 = subprocess1.spawnTerminal(spec1)
+    assert.equal(res1.shellActivity, false)
+    assert.deepEqual(res1.argv, [process.execPath, path.join(home, '.dsh', 'dsh-ssh', 'dsh-remote-shell.js')])
+
+    // Test subprocess2 (from ctx.inject subprocess)
+    const spec2 = { cwd: path.join(anchor, 'src'), argv: ['sh'], shellActivity: true }
+    const res2 = subprocess2.spawnTerminal(spec2)
+    assert.equal(res2.shellActivity, false)
+
+    // Test new agent via agent/created
+    const subprocessAgent = { spawnTerminal(spec) { return spec } }
+    const agent = { ctx: { get(name) { return name === 'subprocess' ? subprocessAgent : undefined } } }
+    const agentCreatedCb = callbacks.get('agent/created')
+    assert.equal(typeof agentCreatedCb, 'function')
+    agentCreatedCb({ agent })
+
+    const resAgent = subprocessAgent.spawnTerminal({ cwd: path.join(anchor, 'src'), argv: ['zsh'], shellActivity: true })
+    assert.equal(resAgent.shellActivity, false)
+
+    cleanup()
+  } finally {
+    restoreHome(oldHome)
     fs.rmSync(home, { recursive: true, force: true })
   }
 })
