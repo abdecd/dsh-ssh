@@ -519,6 +519,16 @@ test('registerFsInterceptors passes through local workspace requests to original
 
   assert.equal(passedThrough, true, 'local workspace request must be passed through to original handler')
   assert.deepEqual(receivedPayload, { path: '/local/test.txt' }, 'payload must be preserved and replayed')
+
+  // The new batch route must preserve local requests as well.
+  passedThrough = false
+  const batchPayload = { cwd: '/local', paths: ['/local', '/local/src'] }
+  const batchReq = Readable.from([Buffer.from(JSON.stringify(batchPayload))])
+  batchReq.method = 'POST'
+  batchReq.url = '/sidebar/api/fs.trees'
+  await mockWebServer.exact.get(batchReq.url).handler(batchReq, fakeRes)
+  assert.equal(passedThrough, true)
+  assert.deepEqual(receivedPayload, batchPayload)
 })
 
 test('remoteBrowseDirs blocks dangerous characters and unvalidated hosts', async () => {
@@ -1304,3 +1314,376 @@ test('hookNativeTerminals handles delayed subprocess injection and agent lifecyc
   }
 })
 
+test('registerFsInterceptors registers sidebar filesystem methods including the batch fs.trees route', async () => {
+  const { registerFsInterceptors } = await import('../lib/index.js')
+  const mockServer = {
+    exact: new Map(),
+    prefixes: new Map(),
+    register(route) {
+      if (route.kind === 'exact') this.exact.set(route.path, route)
+      return () => this.exact.delete(route.path)
+    }
+  }
+  const mockCtx = {
+    webServer: mockServer,
+    effect(fn) { return fn() }
+  }
+
+  registerFsInterceptors(mockCtx)
+
+  const expectedRoutes = [
+    '/sidebar/api/fs.tree',
+    '/sidebar/api/fs.trees',
+    '/sidebar/api/fs.read',
+    '/sidebar/api/fs.write',
+    '/sidebar/api/fs.search'
+  ]
+
+  for (const r of expectedRoutes) {
+    assert(mockServer.exact.has(r), `Route ${r} must be registered`)
+  }
+})
+
+test('opening sidebar (fs.trees) triggers 401 needAuth for password-authenticated remote workspace without cached password', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+  const { Readable } = await import('node:stream')
+  const { registerFsInterceptors, removeHostPassword } = await import('../lib/index.js')
+
+  const oldHome = process.env.HOME
+  const fakeHome = path.join(os.tmpdir(), 'fake-home-trees-auth-' + Date.now())
+  const fakeSshDir = path.join(fakeHome, '.ssh')
+  const fakeWsDir = path.join(fakeHome, '.dsh', 'dsh-ssh', 'workspaces')
+  const fakeAnchor = path.join(fakeWsDir, 'ws-trees-test')
+
+  fs.mkdirSync(fakeSshDir, { recursive: true })
+  fs.mkdirSync(fakeAnchor, { recursive: true })
+  fs.writeFileSync(path.join(fakeSshDir, 'config'), 'Host pass-server\n  HostName 192.168.1.100\n  PasswordAuthentication yes\n', 'utf8')
+  fs.writeFileSync(path.join(fakeAnchor, '.remote-ssh.json'), JSON.stringify({
+    host: 'pass-server',
+    remotePath: '/var/www/my-project',
+    authType: 'password'
+  }), 'utf8')
+
+  process.env.HOME = fakeHome
+  removeHostPassword('pass-server')
+
+  try {
+    const mockServer = {
+      exact: new Map(),
+      prefixes: new Map(),
+      register(route) {
+        if (route.kind === 'exact') this.exact.set(route.path, route)
+        return () => this.exact.delete(route.path)
+      }
+    }
+    const mockCtx = {
+      webServer: mockServer,
+      effect(fn) { return fn() }
+    }
+
+    registerFsInterceptors(mockCtx)
+    const route = mockServer.exact.get('/sidebar/api/fs.trees')
+    assert(route, 'fs.trees route must exist')
+
+    // Simulate sidebar mounting: sends fs.trees with cwd and paths
+    const req = Readable.from([Buffer.from(JSON.stringify({
+      sessionId: 'test-session-123',
+      cwd: fakeAnchor,
+      paths: [fakeAnchor]
+    }))])
+    req.method = 'POST'
+    req.url = '/sidebar/api/fs.trees'
+    req.headers = {
+      host: '127.0.0.1:3080',
+      origin: 'http://127.0.0.1:3080',
+      'content-type': 'application/json'
+    }
+    req.socket = { remoteAddress: '127.0.0.1' }
+
+    let statusCode = 0
+    let resData = null
+    const res = {
+      writeHead(status) { statusCode = status },
+      end(body) { if (body) resData = JSON.parse(body) }
+    }
+
+    await route.handler(req, res)
+
+    // MUST return 401 with needAuth: true and host: 'pass-server'
+    assert.equal(statusCode, 401, 'Opening sidebar without cached password must return 401')
+    assert.equal(resData?.ok, false)
+    assert.equal(resData?.needAuth, true, 'needAuth flag must be true')
+    assert.equal(resData?.host, 'pass-server', 'host must match the remote host')
+    assert.equal(resData?.error?.code, 'need-auth')
+  } finally {
+    removeHostPassword('pass-server')
+    restoreHome(oldHome)
+    fs.rmSync(fakeHome, { recursive: true, force: true })
+  }
+})
+
+test('opening sidebar (fs.trees) returns directory levels when authenticated', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+  const { Readable } = await import('node:stream')
+  const { registerFsInterceptors, setHostPassword, removeHostPassword } = await import('../lib/index.js')
+
+  const oldHome = process.env.HOME
+  const oldPath = process.env.PATH
+  const fakeHome = path.join(os.tmpdir(), 'fake-home-trees-ok-' + Date.now())
+  const binDir = path.join(fakeHome, 'bin')
+  const fakeSshDir = path.join(fakeHome, '.ssh')
+  const fakeWsDir = path.join(fakeHome, '.dsh', 'dsh-ssh', 'workspaces')
+  const fakeAnchor = path.join(fakeWsDir, 'ws-trees-ok')
+  const remoteDir = path.join(fakeHome, 'remote-data')
+
+  fs.mkdirSync(binDir, { recursive: true })
+  fs.mkdirSync(fakeSshDir, { recursive: true })
+  fs.mkdirSync(fakeAnchor, { recursive: true })
+  fs.mkdirSync(path.join(remoteDir, 'src'), { recursive: true })
+  fs.writeFileSync(path.join(remoteDir, 'package.json'), '{}')
+  fs.writeFileSync(path.join(remoteDir, 'src', 'index.ts'), 'console.log(1)')
+
+  fs.writeFileSync(path.join(fakeSshDir, 'config'), 'Host pass-server-ok\n  HostName 192.168.1.101\n  PasswordAuthentication yes\n', 'utf8')
+  fs.writeFileSync(path.join(fakeAnchor, '.remote-ssh.json'), JSON.stringify({
+    host: 'pass-server-ok',
+    remotePath: remoteDir,
+    authType: 'password'
+  }), 'utf8')
+
+  // Create fake ssh binary that executes directly via sh
+  const fakeSsh = path.join(binDir, 'ssh')
+  fs.writeFileSync(fakeSsh, '#!/bin/sh\nfor arg do last="$arg"; done\nexec /bin/sh -c "$last"\n', 'utf8')
+  fs.chmodSync(fakeSsh, 0o755)
+
+  // Create fake sshpass binary that ignores password and invokes ssh
+  const fakeSshpass = path.join(binDir, 'sshpass')
+  fs.writeFileSync(fakeSshpass, '#!/bin/sh\nshift\nexec "$@"\n', 'utf8')
+  fs.chmodSync(fakeSshpass, 0o755)
+
+  process.env.HOME = fakeHome
+  process.env.PATH = `${binDir}${path.delimiter}${oldPath || ''}`
+  setHostPassword('pass-server-ok', 'my-valid-password')
+
+  try {
+    const mockServer = {
+      exact: new Map(),
+      prefixes: new Map(),
+      register(route) {
+        if (route.kind === 'exact') this.exact.set(route.path, route)
+        return () => this.exact.delete(route.path)
+      }
+    }
+    const mockCtx = {
+      webServer: mockServer,
+      effect(fn) { return fn() }
+    }
+
+    registerFsInterceptors(mockCtx)
+    const route = mockServer.exact.get('/sidebar/api/fs.trees')
+
+    // Request listing both root anchor and nested src subdirectory
+    const srcLocal = path.join(fakeAnchor, 'src')
+    const req = Readable.from([Buffer.from(JSON.stringify({
+      sessionId: 'test-session-ok',
+      cwd: fakeAnchor,
+      paths: [fakeAnchor, 'src', '/outside-workspace']
+    }))])
+    req.method = 'POST'
+    req.url = '/sidebar/api/fs.trees'
+    req.headers = {
+      host: '127.0.0.1:3080',
+      origin: 'http://127.0.0.1:3080',
+      'content-type': 'application/json'
+    }
+    req.socket = { remoteAddress: '127.0.0.1' }
+
+    let statusCode = 0
+    let resData = null
+    const res = {
+      writeHead(status) { statusCode = status },
+      end(body) { if (body) resData = JSON.parse(body) }
+    }
+
+    await route.handler(req, res)
+
+    assert.equal(statusCode, 200, 'Authenticated fs.trees must return 200')
+    assert.equal(resData?.ok, true)
+    assert(Array.isArray(resData?.value?.levels), 'levels must be an array')
+    assert.equal(resData?.value?.levels.length, 3)
+    const blocked = resData.value.levels.find((level) => level.path === '/outside-workspace')
+    assert.match(blocked.error, /路径遍历拦截/)
+    assert.deepEqual(blocked.entries, [])
+
+    // Root level contains package.json and src
+    const rootLevel = resData.value.levels.find((l) => l.path === fakeAnchor)
+    assert(rootLevel, 'root level must be present')
+    const names = rootLevel.entries.map((e) => e.name)
+    assert(names.includes('package.json'), 'package.json must be listed')
+    assert(names.includes('src'), 'src directory must be listed')
+
+    // Nested level contains index.ts
+    const subLevel = resData.value.levels.find((l) => l.path === srcLocal)
+    assert(subLevel, 'sub level must be present')
+    const subNames = subLevel.entries.map((e) => e.name)
+    assert(subNames.includes('index.ts'), 'index.ts must be listed in subfolder')
+  } finally {
+    removeHostPassword('pass-server-ok')
+    restoreHome(oldHome)
+    if (oldPath === undefined) delete process.env.PATH
+    else process.env.PATH = oldPath
+    fs.rmSync(fakeHome, { recursive: true, force: true })
+  }
+})
+
+test('opening sidebar (fs.trees) catches SSH auth failure, removes invalid cached password and returns 401 needAuth', async () => {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const os = await import('node:os')
+  const { Readable } = await import('node:stream')
+  const { registerFsInterceptors, setHostPassword, hasHostPassword, removeHostPassword } = await import('../lib/index.js')
+
+  const oldHome = process.env.HOME
+  const oldPath = process.env.PATH
+  const fakeHome = path.join(os.tmpdir(), 'fake-home-trees-fail-' + Date.now())
+  const binDir = path.join(fakeHome, 'bin')
+  const fakeSshDir = path.join(fakeHome, '.ssh')
+  const fakeWsDir = path.join(fakeHome, '.dsh', 'dsh-ssh', 'workspaces')
+  const fakeAnchor = path.join(fakeWsDir, 'ws-trees-fail')
+
+  fs.mkdirSync(binDir, { recursive: true })
+  fs.mkdirSync(fakeSshDir, { recursive: true })
+  fs.mkdirSync(fakeAnchor, { recursive: true })
+
+  fs.writeFileSync(path.join(fakeSshDir, 'config'), 'Host pass-server-fail\n  HostName 192.168.1.102\n  PasswordAuthentication yes\n', 'utf8')
+  fs.writeFileSync(path.join(fakeAnchor, '.remote-ssh.json'), JSON.stringify({
+    host: 'pass-server-fail',
+    remotePath: '/var/www/proj',
+    authType: 'password'
+  }), 'utf8')
+
+  // Create fake ssh binary that fails with permission denied
+  const fakeSsh = path.join(binDir, 'ssh')
+  fs.writeFileSync(fakeSsh, '#!/bin/sh\n>&2 echo "Permission denied (password)."\nexit 1\n', 'utf8')
+  fs.chmodSync(fakeSsh, 0o755)
+
+  const fakeSshpass = path.join(binDir, 'sshpass')
+  fs.writeFileSync(fakeSshpass, '#!/bin/sh\nshift\nexec "$@"\n', 'utf8')
+  fs.chmodSync(fakeSshpass, 0o755)
+
+  process.env.HOME = fakeHome
+  process.env.PATH = `${binDir}${path.delimiter}${oldPath || ''}`
+  setHostPassword('pass-server-fail', 'wrong-pass')
+  assert.equal(hasHostPassword('pass-server-fail'), true)
+
+  try {
+    const mockServer = {
+      exact: new Map(),
+      prefixes: new Map(),
+      register(route) {
+        if (route.kind === 'exact') this.exact.set(route.path, route)
+        return () => this.exact.delete(route.path)
+      }
+    }
+    const mockCtx = {
+      webServer: mockServer,
+      effect(fn) { return fn() }
+    }
+
+    registerFsInterceptors(mockCtx)
+    const route = mockServer.exact.get('/sidebar/api/fs.trees')
+
+    const req = Readable.from([Buffer.from(JSON.stringify({
+      sessionId: 'test-session-fail',
+      cwd: fakeAnchor,
+      paths: [fakeAnchor]
+    }))])
+    req.method = 'POST'
+    req.url = '/sidebar/api/fs.trees'
+    req.headers = {
+      host: '127.0.0.1:3080',
+      origin: 'http://127.0.0.1:3080',
+      'content-type': 'application/json'
+    }
+    req.socket = { remoteAddress: '127.0.0.1' }
+
+    let statusCode = 0
+    let resData = null
+    const res = {
+      writeHead(status) { statusCode = status },
+      end(body) { if (body) resData = JSON.parse(body) }
+    }
+
+    await route.handler(req, res)
+
+    // MUST clear memory password and return 401 needAuth
+    assert.equal(statusCode, 401, 'SSH auth failure must return 401')
+    assert.equal(resData?.ok, false)
+    assert.equal(resData?.needAuth, true)
+    assert.equal(resData?.host, 'pass-server-fail')
+    assert.equal(hasHostPassword('pass-server-fail'), false, 'Cached password must be cleared on auth failure')
+  } finally {
+    removeHostPassword('pass-server-fail')
+    restoreHome(oldHome)
+    if (oldPath === undefined) delete process.env.PATH
+    else process.env.PATH = oldPath
+    fs.rmSync(fakeHome, { recursive: true, force: true })
+  }
+})
+
+
+test('built client opens password modal for batch 401 and refreshes files after authentication', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { runInNewContext } = await import('node:vm')
+  let client
+  let modalTree
+  const stateUpdates = []
+  const events = []
+  const React = {
+    createElement: (type, props, ...children) => ({ type, props: { ...props, children } }),
+    useState: (initial) => [initial, (value) => stateUpdates.push(value)],
+    useEffect: (callback) => callback(),
+    useRef: (value) => ({ current: value })
+  }
+  const document = {
+    getElementById: () => null,
+    createElement: () => ({}),
+    head: { appendChild() {} },
+    body: { appendChild() {} },
+    querySelector: () => null
+  }
+  const response = new Response(JSON.stringify({ ok: false, needAuth: true, host: 'batch-host' }), { status: 401 })
+  const window = {
+    fetch: async () => response,
+    dispatchEvent: (event) => events.push(event.type),
+    __ModuleLoader__: {
+      load({ factory }) {
+        client = factory((name) => {
+          if (name === 'react') return React
+          if (name === 'react/jsx-runtime') return {
+            jsx: (type, props) => ({ type, props }),
+            jsxs: (type, props) => ({ type, props })
+          }
+          return { render(element) { modalTree = element.type() } }
+        })
+      }
+    }
+  }
+  runInNewContext(readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8'), {
+    window, document,
+    CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options?.detail } },
+    MutationObserver: class { observe() {} },
+    setInterval() {}
+  })
+  client.apply({})
+  const returned = await window.fetch('/sidebar/api/fs.trees')
+  assert.equal(returned, response, 'fetch must preserve the original response')
+  assert.ok(stateUpdates.includes('batch-host'), '401 must open the password modal for the host')
+  assert.equal((await returned.json()).needAuth, true, 'hook must not consume the response body')
+  const reAuthElement = modalTree.props.children[1]
+  reAuthElement.props.onSuccess()
+  assert.deepEqual(events, ['dsh-ssh-reauth-success', 'dsh-sidebar:refresh-files'])
+})

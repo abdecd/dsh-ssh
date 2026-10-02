@@ -794,8 +794,10 @@ function GlobalModalHost() {
         isOpen={Boolean(reAuthHost)}
         onClose={() => setReAuthHost(null)}
         onSuccess={() => {
+          const currentHost = reAuthHost
           setReAuthHost(null)
-          window.dispatchEvent(new CustomEvent('dsh-ssh-reauth-success', { detail: { host: reAuthHost } }))
+          window.dispatchEvent(new CustomEvent('dsh-ssh-reauth-success', { detail: { host: currentHost } }))
+          window.dispatchEvent(new CustomEvent('dsh-sidebar:refresh-files'))
         }}
       />
     </>

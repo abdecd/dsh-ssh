@@ -1,3 +1,4 @@
+import { resolve } from 'node:path'
 import { findRemoteWorkspaceMeta, localToRemotePath } from './workspace'
 import {
   remoteListDir,
@@ -163,7 +164,7 @@ function writeError(res: any, status = 400, message = 'operation failed'): void 
 // ---------------------------------------------------------------------------
 
 export function registerFsInterceptors(ctx: any) {
-  const methods = ['fs.tree', 'fs.read', 'fs.write', 'fs.search']
+  const methods = ['fs.tree', 'fs.trees', 'fs.read', 'fs.write', 'fs.search']
 
   for (const method of methods) {
     ctx.effect(() => {
@@ -201,17 +202,32 @@ export function registerFsInterceptors(ctx: any) {
             if (!activeCwd && payload.path) {
               activeCwd = payload.path
             }
+            if (!activeCwd && Array.isArray(payload.paths) && payload.paths[0]) {
+              activeCwd = payload.paths[0]
+            }
 
             // Check if this path belongs to a remote workspace
-            const remoteInfo = findRemoteWorkspaceMeta(activeCwd) || (payload.path ? findRemoteWorkspaceMeta(payload.path) : null)
+            let remoteInfo = findRemoteWorkspaceMeta(activeCwd) || (payload.path ? findRemoteWorkspaceMeta(payload.path) : null)
+            if (!remoteInfo && Array.isArray(payload.paths)) {
+              for (const p of payload.paths) {
+                if (typeof p === 'string') {
+                  const found = findRemoteWorkspaceMeta(p)
+                  if (found) {
+                    remoteInfo = found
+                    break
+                  }
+                }
+              }
+            }
 
             if (remoteInfo) {
               // ==========================================
               // REMOTE WORKSPACE: Handled by dsh-ssh
               // ==========================================
               const { meta, anchorDir } = remoteInfo
+              const isPassword = meta.authType === 'password'
 
-              if (meta.authType === 'password' && !hasHostPassword(meta.host)) {
+              if (isPassword && !hasHostPassword(meta.host)) {
                 writeJson(res, 401, {
                   ok: false,
                   needAuth: true,
@@ -222,7 +238,7 @@ export function registerFsInterceptors(ctx: any) {
               }
 
               const handleAuthError = (result: any) => {
-                if (meta.authType === 'password' && result.error && /认证失败|permission denied/i.test(result.error)) {
+                if (isPassword && result.error && /认证失败|permission denied/i.test(result.error)) {
                   removeHostPassword(meta.host)
                   writeJson(res, 401, {
                     ok: false,
@@ -236,7 +252,51 @@ export function registerFsInterceptors(ctx: any) {
               }
 
               try {
-                if (method === 'fs.tree') {
+                if (method === 'fs.trees') {
+                  // Match better-sidebar's bounded batch contract; malformed batches
+                  // must not silently turn into a request for the workspace root.
+                  const rawPaths: string[] = Array.isArray(payload.paths)
+                    ? payload.paths.filter((p: unknown): p is string => typeof p === 'string' && p !== '')
+                    : []
+                  if (rawPaths.length === 0 || rawPaths.length > 64) {
+                    writeJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'paths must contain between 1 and 64 directory paths' } })
+                    return
+                  }
+
+                  const levels: Array<{ path: string; entries: import('./connection').FsEntry[]; truncated: boolean; error?: string }> = []
+
+                  for (const rawPath of rawPaths) {
+                    const targetLocal = resolve(activeCwd || anchorDir, rawPath)
+                    try {
+                      const remoteTarget = localToRemotePath(targetLocal, anchorDir, meta.remotePath)
+                      const result = await remoteListDir(meta.host, remoteTarget, targetLocal)
+                      if (handleAuthError(result)) return
+                      if (result.ok && result.data) {
+                        levels.push({
+                          path: targetLocal,
+                          entries: result.data.entries,
+                          truncated: result.data.truncated
+                        })
+                      } else {
+                        levels.push({
+                          path: targetLocal,
+                          entries: [],
+                          truncated: false,
+                          error: result.error || '读取远程目录失败'
+                        })
+                      }
+                    } catch (err: any) {
+                      levels.push({
+                        path: targetLocal,
+                        entries: [],
+                        truncated: false,
+                        error: err?.message || '读取远程目录失败'
+                      })
+                    }
+                  }
+
+                  writeOk(res, { levels })
+                } else if (method === 'fs.tree') {
                   const targetLocal = payload.path || activeCwd || anchorDir
                   const remoteTarget = localToRemotePath(targetLocal, anchorDir, meta.remotePath)
                   const result = await remoteListDir(meta.host, remoteTarget, targetLocal)
@@ -248,6 +308,10 @@ export function registerFsInterceptors(ctx: any) {
                   }
                 } else if (method === 'fs.read') {
                   const targetLocal = payload.path
+                  if (!targetLocal) {
+                    writeError(res, 400, 'path is required')
+                    return
+                  }
                   const remoteTarget = localToRemotePath(targetLocal, anchorDir, meta.remotePath)
                   const result = await remoteReadFile(meta.host, remoteTarget)
                   if (handleAuthError(result)) return
@@ -258,6 +322,10 @@ export function registerFsInterceptors(ctx: any) {
                   }
                 } else if (method === 'fs.write') {
                   const targetLocal = payload.path
+                  if (!targetLocal) {
+                    writeError(res, 400, 'path is required')
+                    return
+                  }
                   const remoteTarget = localToRemotePath(targetLocal, anchorDir, meta.remotePath)
                   const result = await remoteWriteFile(meta.host, remoteTarget, payload.content || '')
                   if (handleAuthError(result)) return
