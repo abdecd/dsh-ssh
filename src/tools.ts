@@ -1,6 +1,6 @@
 import { posix } from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { parseSshConfig, isValidSshHost } from './config'
+import { isValidSshHost } from './config'
 import { runSsh, remoteReadFile, remoteWriteFile, shellQuote, shellCd, hasHostPassword } from './connection'
 import { findRemoteWorkspaceMeta } from './workspace'
 
@@ -121,27 +121,7 @@ export function registerTools(ctx: any): () => void {
   const register = (tool: any) => ctx.tools.register(defineTool(tool))
   const disposers: Array<(() => void) | undefined> = []
 
-  // 1. remote_ssh_hosts
-  disposers.push(register({
-    name: 'remote_ssh_hosts',
-    description: '列出当前从 ~/.ssh/config 中发现的所有可用远程主机配置，以及当前会话绑定的远程工作区状态。',
-    parameters: {},
-    output: {
-      schema: { type: 'json' },
-      render: textRender((_, v) => JSON.stringify(v, null, 2))
-    },
-    execute: async (_args: any, exec: any) => {
-      const hosts = parseSshConfig()
-      const sessionCwd = resolveSessionCwd(ctx, exec)
-      const info = findRemoteWorkspaceMeta(sessionCwd)
-      return toCleanJson({
-        hosts,
-        currentRemote: info ? info.meta : null
-      })
-    }
-  }))
-
-  // 2. remote_ssh_exec
+  // 1. remote_ssh_exec
   disposers.push(register({
     name: 'remote_ssh_exec',
     description: '在远程 SSH 主机上执行 Shell 命令。如果在远程工作区中，可免填 host 并自动在远程工作区目录下执行。',
@@ -170,7 +150,7 @@ export function registerTools(ctx: any): () => void {
           ok: false,
           exitCode: -1,
           stdout: '',
-          stderr: '未指定 host，且当前会话不是远程工作区。请提供 host 参数（如 remote_ssh_hosts 中列出的主机）。',
+          stderr: '未指定 host，且当前会话不是远程工作区',
           error: '未指定 host，且当前会话不是远程工作区'
         })
       }
@@ -195,7 +175,7 @@ export function registerTools(ctx: any): () => void {
     }
   }))
 
-  // 3. remote_ssh_read
+  // 2. remote_ssh_read
   disposers.push(register({
     name: 'remote_ssh_read',
     description: '读取远程主机上的文件文本内容。',
@@ -232,7 +212,7 @@ export function registerTools(ctx: any): () => void {
     }
   }))
 
-  // 4. remote_ssh_write
+  // 3. remote_ssh_write
   disposers.push(register({
     name: 'remote_ssh_write',
     description: '在远程主机上创建或覆盖写入文件内容。',

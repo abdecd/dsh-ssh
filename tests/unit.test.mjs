@@ -127,13 +127,15 @@ test('tool outputs are guaranteed to be lossless JSON', async () => {
   assert.equal(snap1.exitCode, 0)
   assert.equal(snap1.error, undefined)
 
-  // Simulated hosts output
-  const hostsOutput = toCleanJson({
-    hosts: [{ host: 'orangepi', hostName: '192.168.2.110', user: undefined }],
-    currentRemote: null
+  // Simulated read output with optional undefined fields
+  const readOutput = toCleanJson({
+    ok: true,
+    path: "/root/test.txt",
+    content: "hello",
+    error: undefined
   })
-  const snap2 = snapshotJsonValue(hostsOutput)
-  assert.notEqual(snap2, undefined, 'hosts output must be lossless JSON')
+  const snap2 = snapshotJsonValue(readOutput)
+  assert.notEqual(snap2, undefined, 'read output must be lossless JSON')
 })
 
 test('hookWorkspaceRegistryDeletion removes anchor directory upon deletion', async () => {
@@ -917,14 +919,14 @@ test('setupRemoteTools injects tools only into remote workspace agents and never
     const globalVisible = [...ctx.tools.view().visible.keys()]
     assert.deepEqual(globalVisible, [], 'global tool layer must not have remote_ssh tools injected')
 
-    // Verify remote agent HAS all 4 exclusive tools
+    // Verify remote agent HAS all 3 exclusive tools
     const remoteVisible = [...ctx.tools.view(agentRemote).visible.keys()]
     assert(remoteVisible.includes('remote_ssh_exec'), 'remote agent must have remote_ssh_exec')
     assert(remoteVisible.includes('remote_ssh_read'), 'remote agent must have remote_ssh_read')
     assert(remoteVisible.includes('remote_ssh_write'), 'remote agent must have remote_ssh_write')
-    assert(remoteVisible.includes('remote_ssh_hosts'), 'remote agent must have remote_ssh_hosts')
+    assert(!remoteVisible.includes('remote_ssh_hosts'), 'remote agent must not have redundant remote_ssh_hosts')
 
-    // Verify local agent DOES NOT HAVE ANY of the 4 exclusive tools
+    // Verify local agent DOES NOT HAVE ANY of the 3 exclusive tools
     const localVisible = [...ctx.tools.view(agentLocal).visible.keys()]
     assert.deepEqual(localVisible, [], 'non-remote workspace agent must not have any remote_ssh tools')
 
