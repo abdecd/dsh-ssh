@@ -1273,6 +1273,7 @@ test('hookNativeTerminals handles delayed subprocess injection and agent lifecyc
     const subprocess2 = { spawnTerminal(spec) { calls.push(spec); return spec } }
 
     const callbacks = new Map()
+    let childFiberDisposals = 0
     const mockCtx = {
       get(name) { return name === 'subprocess' ? subprocess1 : undefined },
       on(event, cb) {
@@ -1281,7 +1282,7 @@ test('hookNativeTerminals handles delayed subprocess injection and agent lifecyc
       },
       inject(deps, cb) {
         if (deps.includes('subprocess')) cb({ subprocess: subprocess2 })
-        return () => {}
+        return { dispose() { childFiberDisposals++ } }
       },
       effect() {}
     }
@@ -1310,6 +1311,7 @@ test('hookNativeTerminals handles delayed subprocess injection and agent lifecyc
     assert.equal(resAgent.shellActivity, false)
 
     cleanup()
+    assert.equal(childFiberDisposals, 0, 'ctx.inject returns child fibers; the parent Cordis plugin owns their disposal')
   } finally {
     restoreHome(oldHome)
     fs.rmSync(home, { recursive: true, force: true })

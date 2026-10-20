@@ -34,17 +34,18 @@ export function hookNativeTerminals(ctx: any): () => void {
   try { install(ctx.get?.('subprocess')) } catch { /* optional */ }
   try { for (const agent of ctx.agents?.list?.() || []) installAgent(agent) } catch {}
   const stopCreated = ctx.on?.('agent/created', ({ agent }: any) => installAgent(agent))
-  const stopSubprocess = ctx.inject?.(['subprocess'], (scoped: any) => {
+  // `ctx.inject()` starts child Cordis fibers and returns a Fiber, not a
+  // disposer function. The parent plugin owns their lifecycle, so don't call
+  // the return value during cleanup; Cordis disposes these children itself.
+  ctx.inject?.(['subprocess'], (scoped: any) => {
     install(scoped.subprocess)
   })
-  const stopAgents = ctx.inject?.(['agents'], (scoped: any) => {
+  ctx.inject?.(['agents'], (scoped: any) => {
     for (const agent of scoped.agents?.list?.() || []) installAgent(agent)
   })
 
   const cleanup = () => {
     stopCreated?.()
-    stopSubprocess?.()
-    stopAgents?.()
     for (const provider of providers) {
       const entry = wrapped.get(provider)
       if (entry && provider.spawnTerminal === entry.wrapper) provider.spawnTerminal = entry.original
