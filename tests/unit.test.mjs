@@ -1171,7 +1171,7 @@ test('native terminal hook routes only managed remote workspaces through SSH wra
   }
 })
 
-test('DSH 0.2.0-rc.2 target cohort and peer dependencies integrity', async () => {
+test('DSH 0.2.1-rc.5 target cohort and peer dependencies integrity', async () => {
   const fs = await import('node:fs')
   const path = await import('node:path')
   const pkgPath = path.resolve('package.json')
@@ -1190,19 +1190,19 @@ test('DSH 0.2.0-rc.2 target cohort and peer dependencies integrity', async () =>
     '@deepseek-ai/dsh-client-ui-primitives'
   ])
 
-  // 3. Peer dependencies: DSH packages must be ^0.2.0-rc.2, cordis ^4.0.1
-  assert.equal(pkg.peerDependencies['@deepseek-ai/cordis'], '^4.0.1')
-  assert.equal(pkg.peerDependencies['@deepseek-ai/dsh-host-webserver'], '^0.2.0-rc.2')
-  assert.equal(pkg.peerDependencies['@deepseek-ai/dsh-tools'], '^0.2.0-rc.2')
-  assert.equal(pkg.peerDependencies['@deepseek-ai/dsh-workspace'], '^0.2.0-rc.2')
+  // 3. Peer dependencies: DSH packages must be ^0.2.1-rc.5, cordis ^4.0.5
+  assert.equal(pkg.peerDependencies['@deepseek-ai/cordis'], '^4.0.5')
+  assert.equal(pkg.peerDependencies['@deepseek-ai/dsh-host-webserver'], '^0.2.1-rc.5')
+  assert.equal(pkg.peerDependencies['@deepseek-ai/dsh-tools'], '^0.2.1-rc.5')
+  assert.equal(pkg.peerDependencies['@deepseek-ai/dsh-workspace'], '^0.2.1-rc.5')
 
-  // 4. Dev dependencies: DSH packages must be exact 0.2.0-rc.2, cordis 4.0.4
-  assert.equal(pkg.devDependencies['@deepseek-ai/cordis'], '4.0.4')
-  assert.equal(pkg.devDependencies['@deepseek-ai/dsh-host-webserver'], '0.2.0-rc.2')
-  assert.equal(pkg.devDependencies['@deepseek-ai/dsh-tools'], '0.2.0-rc.2')
-  assert.equal(pkg.devDependencies['@deepseek-ai/dsh-workspace'], '0.2.0-rc.2')
+  // 4. Dev dependencies: DSH packages must be exact 0.2.1-rc.5, cordis 4.0.5
+  assert.equal(pkg.devDependencies['@deepseek-ai/cordis'], '4.0.5')
+  assert.equal(pkg.devDependencies['@deepseek-ai/dsh-host-webserver'], '0.2.1-rc.5')
+  assert.equal(pkg.devDependencies['@deepseek-ai/dsh-tools'], '0.2.1-rc.5')
+  assert.equal(pkg.devDependencies['@deepseek-ai/dsh-workspace'], '0.2.1-rc.5')
 
-  // 5. Installed packages in node_modules must resolve to 0.2.0-rc.2 and cordis 4.0.4
+  // 5. Installed packages in node_modules must resolve to 0.2.1-rc.5 and cordis 4.0.5
   const { createRequire } = await import('node:module')
   const req = createRequire(import.meta.url)
   const cordisPkg = JSON.parse(fs.readFileSync(req.resolve('@deepseek-ai/cordis/package.json'), 'utf8'))
@@ -1210,10 +1210,10 @@ test('DSH 0.2.0-rc.2 target cohort and peer dependencies integrity', async () =>
   const toolsPkg = JSON.parse(fs.readFileSync(req.resolve('@deepseek-ai/dsh-tools/package.json'), 'utf8'))
   const wsPkg = JSON.parse(fs.readFileSync(req.resolve('@deepseek-ai/dsh-workspace/package.json'), 'utf8'))
 
-  assert.equal(cordisPkg.version, '4.0.4')
-  assert.equal(webserverPkg.version, '0.2.0-rc.2')
-  assert.equal(toolsPkg.version, '0.2.0-rc.2')
-  assert.equal(wsPkg.version, '0.2.0-rc.2')
+  assert.equal(cordisPkg.version, '4.0.5')
+  assert.equal(webserverPkg.version, '0.2.1-rc.5')
+  assert.equal(toolsPkg.version, '0.2.1-rc.5')
+  assert.equal(wsPkg.version, '0.2.1-rc.5')
 })
 
 test('native node built entry is side-effect-free on import', async () => {
