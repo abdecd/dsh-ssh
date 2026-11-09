@@ -1,7 +1,7 @@
 import { posix } from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { isValidSshHost } from './config'
-import { runSsh, remoteReadFile, remoteWriteFile, shellQuote, shellCd, hasHostPassword } from './connection'
+import { runSsh, remoteReadFile, remoteWriteFile, remoteReadBytes, shellQuote, shellCd, hasHostPassword } from './connection'
 import { findRemoteWorkspaceMeta } from './workspace'
 
 /** Helper to ensure returned objects are strictly lossless JSON (stripping undefined keys) */
@@ -249,6 +249,127 @@ function formatReadOutput(displayPath: string, outcome: ReadWindowOutcome): stri
   return `<path>${displayPath}</path>\n<type>file</type>\n<content>\n${content}\n</content>`
 }
 
+
+/** Image extensions supported by remote_ssh_read_image */
+const IMAGE_EXTENSIONS: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif'
+}
+
+const PNG_SIGNATURE = [137, 80, 78, 71, 13, 10, 26, 10]
+const JPEG_SIGNATURE = [255, 216, 255]
+
+function matchesBytes(data: Uint8Array, offset: number, expected: number[]): boolean {
+  if (data.byteLength < offset + expected.length) return false
+  return expected.every((byte, index) => data[offset + index] === byte)
+}
+
+function matchesAscii(data: Uint8Array, offset: number, value: string): boolean {
+  if (data.byteLength < offset + value.length) return false
+  for (let index = 0; index < value.length; index += 1) {
+    if (data[offset + index] !== value.charCodeAt(index)) return false
+  }
+  return true
+}
+
+function sniffImageMediaType(data: Uint8Array): string | undefined {
+  if (matchesBytes(data, 0, PNG_SIGNATURE)) return 'image/png'
+  if (matchesBytes(data, 0, JPEG_SIGNATURE)) return 'image/jpeg'
+  if (matchesAscii(data, 0, 'GIF87a') || matchesAscii(data, 0, 'GIF89a')) return 'image/gif'
+  if (matchesAscii(data, 0, 'RIFF') && matchesAscii(data, 8, 'WEBP')) return 'image/webp'
+  return undefined
+}
+
+function imageMediaTypeForPath(filePath: string): string | undefined {
+  return IMAGE_EXTENSIONS[posix.extname(filePath).toLowerCase()]
+}
+
+async function assertImageCapableRoute(ctx: any, exec: any, requestedPath: string) {
+  const routed = exec.agent?.session?.requestHeader?.()?.config
+  const provider = routed?.provider ?? exec.agent?.options?.provider
+  const model = routed?.model ?? exec.agent?.options?.model
+  const llm = ctx.get?.('llm')
+  if (provider === undefined || model === undefined || llm === undefined) {
+    return
+  }
+  try {
+    const active = await llm.resolveModelInfo?.(provider, model, exec.signal)
+    if (active?.inputModalities !== undefined && !active.inputModalities.includes('image')) {
+      throw new Error(`cannot read "${requestedPath}" as an image: model "${model}" does not declare image input; switch to an image-capable model to read images`)
+    }
+  } catch (err: any) {
+    if (err.message?.includes('does not declare image input')) throw err
+  }
+}
+
+const IMAGE_VALUE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: true,
+  properties: {
+    attachmentId: { type: 'string', required: true },
+    mediaType: {
+      type: 'string',
+      enum: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
+      required: true
+    },
+    bytes: { type: 'integer', required: true },
+    width: { type: 'integer', required: true },
+    height: { type: 'integer', required: true },
+    name: { type: 'string' },
+    originalDimensions: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        width: { type: 'integer', required: true },
+        height: { type: 'integer', required: true }
+      }
+    }
+  }
+}
+
+function formatImageReadOutput(displayPath: string, image: any): string {
+  let scaled = ''
+  if (image.originalDimensions !== undefined) {
+    const x = (image.originalDimensions.width / image.width).toFixed(2)
+    const y = (image.originalDimensions.height / image.height).toFixed(2)
+    const advice = x === y ? `multiply coordinates by ${x}` : `multiply x coordinates by ${x} and y coordinates by ${y}`
+    scaled = ` (downscaled from ${image.originalDimensions.width}x${image.originalDimensions.height} px; ${advice} to locate features in the original file)`
+  }
+  return `<path>${displayPath}</path>\n<type>image</type>\n<content>\n${image.mediaType} image, ${image.width}x${image.height} px, ${image.bytes} bytes${scaled}\n</content>`
+}
+
+function imageRefFromValue(image: any): any {
+  return {
+    attachmentId: image.attachmentId,
+    mediaType: image.mediaType,
+    bytes: image.bytes,
+    width: image.width,
+    height: image.height,
+    ...(image.name === undefined ? {} : { name: image.name }),
+    ...(image.originalDimensions === undefined ? {} : { originalDimensions: { ...image.originalDimensions } })
+  }
+}
+
+function imageReadContent(value: any): any[] {
+  if (!value.ok && value.error) {
+    return [{ type: 'text' as const, text: value.error }]
+  }
+  return [
+    {
+      type: 'text' as const,
+      text: formatImageReadOutput(value.path, value.image)
+    },
+    {
+      type: 'image' as const,
+      attachment: imageRefFromValue(value.image)
+    }
+  ]
+}
+
 export function registerTools(ctx: any): () => void {
   const register = (tool: any) => ctx.tools.register(defineTool(tool))
   const disposers: Array<(() => void) | undefined> = []
@@ -354,7 +475,149 @@ export function registerTools(ctx: any): () => void {
     }
   }))
 
-  // 3. remote_ssh_write (commented out as bash / remote_ssh_exec flexibly handles remote file writing)
+
+  // 3. remote_ssh_read_image
+  disposers.push(register({
+    name: 'remote_ssh_read_image',
+    description: '读取远程主机上的 PNG/JPEG/WebP/GIF 图片文件并返回图片本身。大图会自动按比例缩放，以便模型直接视读。',
+    parameters: {
+      file_path: {
+        type: 'string',
+        required: true,
+        description: '远程图片文件路径（绝对路径，或相对远程工作区的相对路径）'
+      },
+      path: {
+        type: 'string',
+        description: '可选，与 file_path 等价，保持向后兼容'
+      },
+      host: {
+        type: 'string',
+        description: '可选，~/.ssh/config 中的主机别名（远程工作区中可免填）'
+      }
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          path: { type: 'string', required: true },
+          image: IMAGE_VALUE_SCHEMA
+        }
+      },
+      render: (_args: any, value: any) => imageReadContent(value),
+      presentationMeta: (_args: any, value: any) => ({ path: value.path })
+    },
+    execute: async (args: any, exec: any) => {
+      const { host, resolvedPath, error: ctxErr } = resolveContext(ctx, args, exec)
+      if (ctxErr) return toCleanJson({ ok: false, error: ctxErr })
+      if (!host) return toCleanJson({ ok: false, error: '未指定 host，且当前会话不是远程工作区' })
+      if (!resolvedPath) return toCleanJson({ ok: false, error: 'file_path 不能为空' })
+
+      const rawPath = args.file_path || args.path || resolvedPath
+      const extension = posix.extname(rawPath).toLowerCase()
+      const declared = imageMediaTypeForPath(rawPath)
+      if (declared === undefined && extension !== '') {
+        return toCleanJson({
+          ok: false,
+          error: `cannot read "${rawPath}": the ${extension} extension does not declare a supported image format; remote_ssh_read_image accepts PNG/JPEG/WebP/GIF files, including extension-less files in those formats`
+        })
+      }
+
+      const attachments = ctx.get?.('attachments')
+      if (attachments === undefined) {
+        return toCleanJson({
+          ok: false,
+          error: `cannot read "${rawPath}" as an image: no attachment service is mounted`
+        })
+      }
+
+      if (declared !== undefined && attachments.imageLimits?.mediaTypes && !attachments.imageLimits.mediaTypes.includes(declared)) {
+        return toCleanJson({
+          ok: false,
+          error: `cannot read "${resolvedPath}": ${declared} images are not accepted by this deployment`
+        })
+      }
+
+      try {
+        await assertImageCapableRoute(ctx, exec, rawPath)
+      } catch (err: any) {
+        return toCleanJson({ ok: false, error: err.message })
+      }
+
+      const authErr = checkToolAuth(ctx, host, exec)
+      if (authErr) return toCleanJson(authErr)
+
+      const byteCap = Math.min(
+        attachments.imageLimits?.maxImageBytes ?? 50 * 1024 * 1024,
+        attachments.imageLimits?.maxMessageImageBytes ?? 50 * 1024 * 1024
+      )
+
+      const r = await remoteReadBytes(host, resolvedPath, byteCap)
+      if (!r.ok || !r.buffer) {
+        return toCleanJson({ ok: false, error: r.error || '读取远程图片文件失败' })
+      }
+
+      const mediaType = declared ?? sniffImageMediaType(r.buffer)
+      if (mediaType === undefined) {
+        return toCleanJson({
+          ok: false,
+          error: `cannot read "${resolvedPath}": the file content is not a supported image format; remote_ssh_read_image accepts PNG/JPEG/WebP/GIF`
+        })
+      }
+
+      if (declared === undefined && attachments.imageLimits?.mediaTypes && !attachments.imageLimits.mediaTypes.includes(mediaType)) {
+        return toCleanJson({
+          ok: false,
+          error: `cannot read "${resolvedPath}": ${mediaType} images are not accepted by this deployment`
+        })
+      }
+
+      let ref: any
+      try {
+        ref = await attachments.saveImage({
+          data: r.buffer,
+          mediaType,
+          name: posix.basename(resolvedPath)
+        })
+      } catch (error: any) {
+        if (error.code === 'IMAGE_DIMENSION_TOO_LARGE') {
+          return toCleanJson({ ok: false, error: `cannot read "${resolvedPath}": at least one image side exceeds the ${attachments.imageLimits?.maxImageDimension}px limit; downscale the image and read the smaller copy` })
+        }
+        if (error.code === 'IMAGE_TOO_MANY_PIXELS') {
+          return toCleanJson({ ok: false, error: `cannot read "${resolvedPath}": the image exceeds the ${attachments.imageLimits?.maxImagePixels}-pixel decoded-size limit; downscale the image and read the smaller copy` })
+        }
+        if (error.code === 'IMAGE_TOO_LARGE') {
+          return toCleanJson({ ok: false, error: `cannot read "${resolvedPath}": the image cannot be stored within the deployment's byte limits; downscale the image and read the smaller copy` })
+        }
+        if (error.code === 'INVALID_IMAGE' && declared === undefined) {
+          return toCleanJson({ ok: false, error: `cannot read "${resolvedPath}": the bytes do not decode as a supported PNG/JPEG/WebP/GIF image; the file may be truncated or corrupt` })
+        }
+        if (error.code === 'IMAGE_TYPE_MISMATCH') {
+          if (declared === undefined) {
+            return toCleanJson({ ok: false, error: `cannot read "${resolvedPath}": the file signature claims ${mediaType}, but the bytes decode as a different image format; the file may be corrupt` })
+          }
+          return toCleanJson({ ok: false, error: `cannot read "${resolvedPath}": the ${extension} extension declares ${mediaType}, but the bytes use a different image format; rename the file to match its actual format if it is PNG/JPEG/WebP/GIF, or convert it to one of those formats` })
+        }
+        return toCleanJson({ ok: false, error: `保存图片附件失败: ${error.message || String(error)}` })
+      }
+
+      return toCleanJson({
+        ok: true,
+        path: resolvedPath,
+        image: {
+          attachmentId: ref.attachmentId,
+          mediaType: ref.mediaType,
+          bytes: ref.bytes,
+          width: ref.width,
+          height: ref.height,
+          ...(ref.name === undefined ? {} : { name: ref.name }),
+          ...(ref.originalDimensions === undefined ? {} : { originalDimensions: { ...ref.originalDimensions } })
+        }
+      })
+    }
+  }))
+
+  // 4. remote_ssh_write (commented out as bash / remote_ssh_exec flexibly handles remote file writing)
   /*
   disposers.push(register({
     name: 'remote_ssh_write',

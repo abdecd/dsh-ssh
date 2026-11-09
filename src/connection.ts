@@ -584,6 +584,69 @@ export async function remoteReadFile(
  * Writes to a unique temp file with restrictive permissions (0600), applies original permissions
  * or safe defaults, and atomically renames via mv to avoid permission loosening or partial writes.
  */
+
+/**
+ * Read raw bytes from a remote file up to maxBytes.
+ * Ideal for reading images, binary assets, and attachments.
+ */
+export async function remoteReadBytes(
+  host: string,
+  remotePath: string,
+  maxBytes: number = 50 * 1024 * 1024
+): Promise<{ ok: boolean; buffer?: Buffer; error?: string }> {
+  const quotedPath = shellQuoteRemotePath(remotePath)
+  const script = `( [ -f ${quotedPath} ] || { echo '__DSH_ERR_NOT_FOUND__'; exit 1; }; ` +
+    `SIZE=$(wc -c < ${quotedPath} 2>/dev/null || stat -c %s ${quotedPath} 2>/dev/null || echo 0); ` +
+    `if [ "$SIZE" -gt ${maxBytes} ]; then echo "__DSH_ERR_TOO_LARGE__:$SIZE"; exit 1; fi; ` +
+    `echo "__DSH_FILE_SIZE__:$SIZE"; ` +
+    `base64 < ${quotedPath} 2>/dev/null; ` +
+    `echo ""; ` +
+    `echo "__DSH_READ_EOF__"; )`
+
+  const r = await runSsh(host, script)
+  if (!r.ok) {
+    if (r.stdout.includes('__DSH_ERR_NOT_FOUND__')) {
+      return { ok: false, error: `远程文件不存在: ${remotePath}` }
+    }
+    if (r.stdout.includes('__DSH_ERR_TOO_LARGE__')) {
+      const match = r.stdout.match(/__DSH_ERR_TOO_LARGE__:(\d+)/)
+      const sizeStr = match ? ` (${Math.round(Number(match[1]) / (1024 * 1024))}MB)` : ''
+      return { ok: false, error: `远程文件过大${sizeStr}，超过 ${Math.round(maxBytes / (1024 * 1024))}MB 限制` }
+    }
+    return { ok: false, error: r.error || r.stderr || '读取文件失败' }
+  }
+
+  if (!r.stdout.includes('__DSH_READ_EOF__') || r.stdoutTruncated) {
+    return { ok: false, error: '远程文件读取未完成（数据传输中断或超过缓冲区限制）' }
+  }
+
+  const sizeMatch = r.stdout.match(/__DSH_FILE_SIZE__:(\d+)/)
+  if (!sizeMatch) {
+    return { ok: false, error: '未能获取远程文件大小元数据' }
+  }
+  const expectedSize = parseInt(sizeMatch[1], 10)
+
+  const startIndex = r.stdout.indexOf(sizeMatch[0]) + sizeMatch[0].length
+  const endIndex = r.stdout.indexOf('__DSH_READ_EOF__')
+  const rawB64 = r.stdout.slice(startIndex, endIndex).replace(/\s+/g, '')
+
+  let buffer: Buffer
+  try {
+    buffer = Buffer.from(rawB64, 'base64')
+  } catch (e) {
+    return { ok: false, error: '解码远程文件失败: ' + String(e) }
+  }
+
+  if (buffer.length !== expectedSize) {
+    return {
+      ok: false,
+      error: `远程文件完整性校验失败：预期大小 ${expectedSize} 字节，实际接收 ${buffer.length} 字节`
+    }
+  }
+
+  return { ok: true, buffer }
+}
+
 export async function remoteWriteFile(
   host: string,
   remotePath: string,

@@ -75,6 +75,15 @@ export declare function remoteReadFile(host: string, remotePath: string): Promis
  * Writes to a unique temp file with restrictive permissions (0600), applies original permissions
  * or safe defaults, and atomically renames via mv to avoid permission loosening or partial writes.
  */
+/**
+ * Read raw bytes from a remote file up to maxBytes.
+ * Ideal for reading images, binary assets, and attachments.
+ */
+export declare function remoteReadBytes(host: string, remotePath: string, maxBytes?: number): Promise<{
+    ok: boolean;
+    buffer?: Buffer;
+    error?: string;
+}>;
 export declare function remoteWriteFile(host: string, remotePath: string, content: string | Buffer): Promise<{
     ok: boolean;
     error?: string;

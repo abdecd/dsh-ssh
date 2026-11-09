@@ -923,6 +923,7 @@ test('setupRemoteTools injects tools only into remote workspace agents and never
     const remoteVisible = [...ctx.tools.view(agentRemote).visible.keys()]
     assert(remoteVisible.includes('remote_ssh_exec'), 'remote agent must have remote_ssh_exec')
     assert(remoteVisible.includes('remote_ssh_read'), 'remote agent must have remote_ssh_read')
+    assert(remoteVisible.includes('remote_ssh_read_image'), 'remote agent must have remote_ssh_read_image')
     assert(!remoteVisible.includes('remote_ssh_write'), 'remote_ssh_write is commented out in favor of bash / remote_ssh_exec')
     assert(!remoteVisible.includes('remote_ssh_hosts'), 'remote agent must not have redundant remote_ssh_hosts')
 
@@ -1863,6 +1864,112 @@ test("remote_ssh_read formats output with line numbers, pagination footers and r
     assert.equal(pagedResult.lines[1].number, 3)
     const pagedRendered = readTool.output.render({ file_path: "config.txt", offset: 2, limit: 2 }, pagedResult)[0].text
     assert.match(pagedRendered, /\(Showing lines 2-3 of 5\. Use offset=4 to continue\.\)/)
+  } finally {
+    process.env.HOME = oldHome
+    process.env.PATH = oldPath
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('remote_ssh_read_image reads remote image, validates extension and integrates with attachments service', async () => {
+  const fs = await import('node:fs')
+  const { registerTools } = await import('../lib/index.js')
+  const path = await import('node:path')
+  const os = await import('node:os')
+  const oldHome = process.env.HOME
+  const oldPath = process.env.PATH
+
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-test-img-'))
+  const binDir = path.join(tempRoot, 'bin')
+  const remoteDir = path.join(tempRoot, 'remote')
+  const sampleImg = path.join(remoteDir, 'diagram.png')
+  const anchor = path.join(tempRoot, '.dsh', 'dsh-ssh', 'workspaces', 'ws-img')
+
+  fs.mkdirSync(binDir, { recursive: true })
+  fs.mkdirSync(remoteDir, { recursive: true })
+  fs.mkdirSync(path.join(anchor, 'src'), { recursive: true })
+  fs.mkdirSync(path.join(tempRoot, '.ssh'), { recursive: true })
+
+  fs.writeFileSync(path.join(tempRoot, '.ssh', 'config'), 'Host test-img\n HostName 127.0.0.1\n')
+  fs.writeFileSync(path.join(anchor, '.remote-ssh.json'), JSON.stringify({ host: 'test-img', remotePath: remoteDir }))
+
+  // Standard 1x1 transparent PNG file bytes
+  const pngBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=', 'base64')
+  fs.writeFileSync(sampleImg, pngBytes)
+
+  const fakeSsh = path.join(binDir, 'ssh')
+  fs.writeFileSync(fakeSsh, '#!/bin/sh\nfor arg do last="$arg"; done\nexec /bin/sh -c "$last"\n', 'utf8')
+  fs.chmodSync(fakeSsh, 0o755)
+
+  process.env.PATH = `${binDir}:${oldPath}`
+  process.env.HOME = tempRoot
+
+  try {
+    const tools = new Map()
+    const savedImages = []
+
+    const mockAttachments = {
+      imageLimits: {
+        mediaTypes: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
+        maxImageBytes: 10 * 1024 * 1024,
+        maxMessageImageBytes: 10 * 1024 * 1024,
+        maxImageDimension: 4096,
+        maxImagePixels: 16777216
+      },
+      async saveImage({ data, mediaType, name }) {
+        savedImages.push({ data, mediaType, name })
+        return {
+          attachmentId: 'att-123456',
+          mediaType,
+          bytes: data.length,
+          width: 1,
+          height: 1,
+          name
+        }
+      }
+    }
+
+    const mockCtx = {
+      tools: { register: (tool) => tools.set(tool.name, tool) },
+      get(name) {
+        if (name === 'attachments') return mockAttachments
+        return undefined
+      }
+    }
+
+    registerTools(mockCtx)
+    const readImageTool = tools.get('remote_ssh_read_image')
+    assert(readImageTool, 'remote_ssh_read_image must be registered')
+
+    const mockExec = { session: { cwd: path.join(anchor, 'src') } }
+
+    // 1. Invalid extension refusal
+    const invalidExt = await readImageTool.execute({
+      file_path: 'test.pdf'
+    }, mockExec)
+    assert.equal(invalidExt.ok, false)
+    assert.match(invalidExt.error, /does not declare a supported image format/)
+
+    // 2. Successful image reading
+    const imgResult = await readImageTool.execute({
+      file_path: 'diagram.png'
+    }, mockExec)
+
+    assert.equal(imgResult.ok, true)
+    assert.equal(imgResult.image.attachmentId, 'att-123456')
+    assert.equal(imgResult.image.mediaType, 'image/png')
+    assert.equal(imgResult.image.width, 1)
+    assert.equal(imgResult.image.height, 1)
+    assert.equal(savedImages.length, 1)
+
+    // 3. Render output validation
+    const renderedBlocks = readImageTool.output.render({ file_path: 'diagram.png' }, imgResult)
+    assert.equal(renderedBlocks.length, 2)
+    assert.equal(renderedBlocks[0].type, 'text')
+    assert(renderedBlocks[0].text.includes('diagram.png</path>'))
+    assert(renderedBlocks[0].text.includes('image/png image, 1x1 px'))
+    assert.equal(renderedBlocks[1].type, 'image')
+    assert.equal(renderedBlocks[1].attachment.attachmentId, 'att-123456')
   } finally {
     process.env.HOME = oldHome
     process.env.PATH = oldPath
