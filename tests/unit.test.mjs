@@ -923,7 +923,7 @@ test('setupRemoteTools injects tools only into remote workspace agents and never
     const remoteVisible = [...ctx.tools.view(agentRemote).visible.keys()]
     assert(remoteVisible.includes('remote_ssh_exec'), 'remote agent must have remote_ssh_exec')
     assert(remoteVisible.includes('remote_ssh_read'), 'remote agent must have remote_ssh_read')
-    assert(remoteVisible.includes('remote_ssh_write'), 'remote agent must have remote_ssh_write')
+    assert(!remoteVisible.includes('remote_ssh_write'), 'remote_ssh_write is commented out in favor of bash / remote_ssh_exec')
     assert(!remoteVisible.includes('remote_ssh_hosts'), 'remote agent must not have redundant remote_ssh_hosts')
 
     // Verify local agent DOES NOT HAVE ANY of the 3 exclusive tools
@@ -1154,15 +1154,17 @@ test('native terminal hook routes only managed remote workspaces through SSH wra
       effect() {}
     })
     onCreate({ agent })
-    const remoteSpec = { cwd: path.join(anchor, 'src'), argv: ['/bin/bash', '-i'], shellActivity: true, cols: 80 }
+    const remoteSpec = { cwd: path.join(anchor, 'src'), argv: ['/bin/bash', '-i'], shellActivity: true, cols: 80, terminalType: 'xterm-256color' }
     const remote = subprocess.spawnTerminal(remoteSpec)
     assert.deepEqual(remote.argv, [process.execPath, path.join(home, '.dsh', 'dsh-ssh', 'dsh-remote-shell.js')])
     assert.equal(remote.shellActivity, false)
     assert.equal(remote.cols, 80)
     assert.deepEqual(remoteSpec.argv, ['/bin/bash', '-i'], 'original request must not be mutated')
     const localSpec = { cwd: local, argv: ['/bin/bash', '-i'], shellActivity: true }
+    const dumbSpec = { cwd: path.join(anchor, 'src'), argv: ['/bin/bash'], terminalType: 'dumb' }
+    assert.equal(subprocess.spawnTerminal(dumbSpec), dumbSpec, 'dumb/AI terminal must remain unchanged on host')
     assert.equal(subprocess.spawnTerminal(localSpec), localSpec, 'local terminals must remain unchanged')
-    assert.equal(calls.length, 2)
+    assert.equal(calls.length, 3)
     cleanup()
     assert.equal(subprocess.spawnTerminal, original, 'hook must be reversible')
   } finally {
@@ -1290,13 +1292,13 @@ test('hookNativeTerminals handles delayed subprocess injection and agent lifecyc
     const cleanup = hookNativeTerminals(mockCtx)
 
     // Test subprocess1 (from ctx.get)
-    const spec1 = { cwd: path.join(anchor, 'src'), argv: ['bash'], shellActivity: true }
+    const spec1 = { cwd: path.join(anchor, 'src'), argv: ['bash'], shellActivity: true, terminalType: 'xterm-256color' }
     const res1 = subprocess1.spawnTerminal(spec1)
     assert.equal(res1.shellActivity, false)
     assert.deepEqual(res1.argv, [process.execPath, path.join(home, '.dsh', 'dsh-ssh', 'dsh-remote-shell.js')])
 
     // Test subprocess2 (from ctx.inject subprocess)
-    const spec2 = { cwd: path.join(anchor, 'src'), argv: ['sh'], shellActivity: true }
+    const spec2 = { cwd: path.join(anchor, 'src'), argv: ['sh'], shellActivity: true, terminalType: 'xterm-256color' }
     const res2 = subprocess2.spawnTerminal(spec2)
     assert.equal(res2.shellActivity, false)
 
@@ -1307,7 +1309,7 @@ test('hookNativeTerminals handles delayed subprocess injection and agent lifecyc
     assert.equal(typeof agentCreatedCb, 'function')
     agentCreatedCb({ agent })
 
-    const resAgent = subprocessAgent.spawnTerminal({ cwd: path.join(anchor, 'src'), argv: ['zsh'], shellActivity: true })
+    const resAgent = subprocessAgent.spawnTerminal({ cwd: path.join(anchor, 'src'), argv: ['zsh'], shellActivity: true, terminalType: 'xterm-256color' })
     assert.equal(resAgent.shellActivity, false)
 
     cleanup()
@@ -1690,4 +1692,180 @@ test('built client opens password modal for batch 401 and refreshes files after 
   const reAuthElement = modalTree.props.children[1]
   reAuthElement.props.onSuccess()
   assert.deepEqual(events, ['dsh-ssh-reauth-success', 'dsh-sidebar:refresh-files'])
+})
+
+test('remote_ssh_read allows reading credential paths and deeply redacts API keys, secrets and passwords', async () => {
+  const fs = await import('node:fs')
+  const { registerTools } = await import('../lib/index.js')
+  const os = await import('node:os')
+  const path = await import('node:path')
+  const oldHome = process.env.HOME
+  const oldPath = process.env.PATH
+
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-test-creds-'))
+  const binDir = path.join(tempRoot, 'bin')
+  const remoteDir = path.join(tempRoot, 'remote')
+  const anchor = path.join(tempRoot, '.dsh', 'dsh-ssh', 'workspaces', 'ws-creds')
+
+  fs.mkdirSync(binDir, { recursive: true })
+  fs.mkdirSync(remoteDir, { recursive: true })
+  fs.mkdirSync(path.join(anchor, 'src'), { recursive: true })
+  fs.mkdirSync(path.join(tempRoot, '.ssh'), { recursive: true })
+
+  fs.writeFileSync(path.join(tempRoot, '.ssh', 'config'), 'Host test-creds\n HostName 127.0.0.1\n')
+  fs.writeFileSync(path.join(anchor, '.remote-ssh.json'), JSON.stringify({ host: 'test-creds', remotePath: remoteDir }))
+
+  // Mock credential files
+  const credsFile = path.join(remoteDir, '.credentials.yaml')
+  fs.writeFileSync(credsFile, [
+    'version: 1',
+    'refs:',
+    '  OPEN_ROUTER_API_KEY: sk-or-v1-9adcdbfdscadsdcsadca3ff385afdfebfcasdc1',
+    'db_url: postgres://admin:mySecretPass123@localhost:5432/app',
+    'DATABASE_PASSWORD: "my_db_password_8888!"',
+    'GITHUB_TOKEN: ghp_111122223333444455556666777788889999'
+  ].join('\n'))
+
+  const idRsaFile = path.join(remoteDir, 'id_rsa')
+  fs.writeFileSync(idRsaFile, [
+    '-----BEGIN OPENSSH PRIVATE KEY-----',
+    'b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABlwAAAAdzc2gtcn',
+    '-----END OPENSSH PRIVATE KEY-----'
+  ].join('\n'))
+
+  const fakeSsh = path.join(binDir, 'ssh')
+  fs.writeFileSync(fakeSsh, '#!/bin/sh\nfor arg do last="$arg"; done\nexec /bin/sh -c "$last"\n', 'utf8')
+  fs.chmodSync(fakeSsh, 0o755)
+
+  process.env.PATH = `${binDir}:${oldPath}`
+  process.env.HOME = tempRoot
+
+  try {
+    const tools = new Map()
+    const mockCtx = {
+      tools: { register: (tool) => tools.set(tool.name, tool) }
+    }
+    registerTools(mockCtx)
+    const readTool = tools.get('remote_ssh_read')
+    assert(readTool, 'remote_ssh_read must be registered')
+
+    const mockExec = { session: { cwd: path.join(anchor, 'src') } }
+
+    // 1. Read credential config: path is allowed, all sensitive values redacted
+    const credResult = await readTool.execute({
+      file_path: '.credentials.yaml'
+    }, mockExec)
+    assert.equal(credResult.ok, true, 'reading credential file must be allowed')
+    const credRendered = readTool.output.render({ file_path: '.credentials.yaml' }, credResult)[0].text
+
+    // Check each sensitive token is replaced with [REDACTED]
+    assert(credRendered.includes('OPEN_ROUTER_API_KEY: [REDACTED]'))
+    assert(credRendered.includes('postgres://admin:[REDACTED]@localhost:5432/app'))
+    assert(credRendered.includes('DATABASE_PASSWORD: "[REDACTED]"'))
+    assert(credRendered.includes('GITHUB_TOKEN: [REDACTED]'))
+    assert(!credRendered.includes('sk-or-v1-9adcdbfdscadsdcsadca3ff385afdfebfcasdc1'))
+    assert(!credRendered.includes('mySecretPass123'))
+    assert(!credRendered.includes('my_db_password_8888!'))
+
+    // 2. Read id_rsa: path is allowed, private key block body is redacted
+    const rsaResult = await readTool.execute({
+      file_path: 'id_rsa'
+    }, mockExec)
+    assert.equal(rsaResult.ok, true, 'reading private key file must be allowed')
+    const rsaRendered = readTool.output.render({ file_path: 'id_rsa' }, rsaResult)[0].text
+    assert.match(rsaRendered, /-----BEGIN OPENSSH PRIVATE KEY-----/)
+    assert.match(rsaRendered, /[REDACTED]/)
+    assert.match(rsaRendered, /-----END OPENSSH PRIVATE KEY-----/)
+    assert(!rsaRendered.includes('b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABlwAAAAdzc2gtcn'))
+  } finally {
+    process.env.HOME = oldHome
+    process.env.PATH = oldPath
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test("remote_ssh_read formats output with line numbers, pagination footers and redacts private key blocks", async () => {
+  const fs = await import("node:fs")
+  const { registerTools } = await import("../lib/index.js")
+  const path = await import("node:path")
+  const os = await import("node:os")
+  const oldHome = process.env.HOME
+  const oldPath = process.env.PATH
+
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-test-format-"))
+  const binDir = path.join(tempRoot, "bin")
+  const remoteDir = path.join(tempRoot, "remote")
+  const sampleFile = path.join(remoteDir, "config.txt")
+  const anchor = path.join(tempRoot, ".dsh", "dsh-ssh", "workspaces", "ws-format")
+
+  fs.mkdirSync(binDir, { recursive: true })
+  fs.mkdirSync(remoteDir, { recursive: true })
+  fs.mkdirSync(path.join(anchor, "src"), { recursive: true })
+  fs.mkdirSync(path.join(tempRoot, ".ssh"), { recursive: true })
+
+  fs.writeFileSync(path.join(tempRoot, ".ssh", "config"), "Host test-fmt\n HostName 127.0.0.1\n")
+  fs.writeFileSync(path.join(anchor, ".remote-ssh.json"), JSON.stringify({ host: "test-fmt", remotePath: remoteDir }))
+
+  const mockFileContent = [
+    "console.log(\"hello\")",
+    "-----BEGIN OPENSSH PRIVATE KEY-----",
+    "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABlwAAAAdzc2gtcn",
+    "-----END OPENSSH PRIVATE KEY-----",
+    "console.log(\"world\")"
+  ].join("\n")
+  fs.writeFileSync(sampleFile, mockFileContent)
+
+  const fakeSsh = path.join(binDir, "ssh")
+  fs.writeFileSync(fakeSsh, "#!/bin/sh\nfor arg do last=\"$arg\"; done\nexec /bin/sh -c \"$last\"\n", "utf8")
+  fs.chmodSync(fakeSsh, 0o755)
+
+  process.env.PATH = `${binDir}:${oldPath}`
+  process.env.HOME = tempRoot
+
+  try {
+    const tools = new Map()
+    const mockCtx = {
+      tools: { register: (tool) => tools.set(tool.name, tool) }
+    }
+    registerTools(mockCtx)
+    const readTool = tools.get("remote_ssh_read")
+
+    const mockExec = { session: { cwd: path.join(anchor, "src") } }
+
+    // Read full file
+    const result = await readTool.execute({
+      file_path: "config.txt"
+    }, mockExec)
+
+    assert.equal(result.ok, true)
+    assert.equal(result.totalLines, 5)
+    assert.equal(result.lines.length, 5)
+    // Check redaction
+    assert.equal(result.lines[1].text, "-----BEGIN OPENSSH PRIVATE KEY-----")
+    assert.equal(result.lines[2].text, "[REDACTED]")
+    assert.equal(result.lines[3].text, "-----END OPENSSH PRIVATE KEY-----")
+
+    // Check rendered text output
+    const rendered = readTool.output.render({ file_path: "config.txt" }, result)[0].text
+    assert(rendered.includes(`<path>${sampleFile}</path>`))
+    assert.match(rendered, /1: console\.log\("hello"\)/)
+    assert(rendered.includes('3: [REDACTED]'))
+    assert.match(rendered, /\(End of file - total 5 lines\)/)
+
+    // Test offset and limit
+    const pagedResult = await readTool.execute({
+      file_path: "config.txt",
+      offset: 2,
+      limit: 2
+    }, mockExec)
+    assert.equal(pagedResult.lines.length, 2)
+    assert.equal(pagedResult.lines[0].number, 2)
+    assert.equal(pagedResult.lines[1].number, 3)
+    const pagedRendered = readTool.output.render({ file_path: "config.txt", offset: 2, limit: 2 }, pagedResult)[0].text
+    assert.match(pagedRendered, /\(Showing lines 2-3 of 5\. Use offset=4 to continue\.\)/)
+  } finally {
+    process.env.HOME = oldHome
+    process.env.PATH = oldPath
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+  }
 })

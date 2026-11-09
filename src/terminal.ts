@@ -15,6 +15,7 @@ export function hookNativeTerminals(ctx: any): () => void {
     if (!provider || typeof provider.spawnTerminal !== 'function' || wrapped.has(provider)) return
     const original = provider.spawnTerminal
     const wrapper = function (this: any, spec: any) {
+      if (spec?.terminalType !== 'xterm-256color') return original.call(this, spec)
       const info = typeof spec?.cwd === 'string' ? findRemoteWorkspaceMeta(spec.cwd) : null
       if (!info) return original.call(this, spec)
       // Interactive password prompts are handled by SSH in the PTY; unlike

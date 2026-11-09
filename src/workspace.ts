@@ -156,7 +156,7 @@ export async function createRemoteWorkspace(
       `This directory is a local anchor for remote SSH host: \`${host}\``,
       `Remote path: \`${cleanRemote}\``,
       '',
-      'AI models must use `remote_ssh_*` tools (`remote_ssh_exec`, `remote_ssh_read`, `remote_ssh_write`) to directly execute commands and read/write remote files.'
+      'AI models must use `remote_ssh_*` tools (`remote_ssh_exec`, `remote_ssh_read`) to directly execute commands and read remote files.'
     ].join('\n')
     writeFileSync(join(anchorDir, 'AGENTS.md'), agentsMd, 'utf8')
 
